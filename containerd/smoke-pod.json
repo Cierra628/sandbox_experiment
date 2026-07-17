@@ -1,0 +1,15 @@
+{
+  "metadata": {
+    "name": "kuasar-smoke",
+    "namespace": "sandbox-experiment",
+    "uid": "kuasar-smoke"
+  },
+  "log_directory": "/tmp/openclaw-kuasar-smoke",
+  "linux": {
+    "security_context": {
+      "namespace_options": {
+        "network": 2
+      }
+    }
+  }
+}

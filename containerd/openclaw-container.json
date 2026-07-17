@@ -1,0 +1,34 @@
+{
+  "metadata": {
+    "name": "openclaw-gateway"
+  },
+  "image": {
+    "image": "localhost/openclaw-kuasar:2026.6.11-virtiofs"
+  },
+  "command": ["node"],
+  "args": ["openclaw.mjs", "gateway", "--bind", "loopback", "--port", "18790"],
+  "working_dir": "/app",
+  "log_path": "openclaw-gateway.log",
+  "envs": [
+    {"key": "HOME", "value": "/home/node"},
+    {"key": "OPENCLAW_STATE_DIR", "value": "/home/node/.openclaw"},
+    {"key": "OPENCLAW_CONFIG_PATH", "value": "/home/node/.openclaw/openclaw.json"},
+    {"key": "OPENCLAW_DISABLE_BONJOUR", "value": "1"},
+    {"key": "OPENCLAW_GATEWAY_PORT", "value": "18790"}
+  ],
+  "mounts": [
+    {
+      "container_path": "/home/node/.openclaw",
+      "host_path": "/home/yyxie/.local/share/openclaw-kuasar/openclaw-state",
+      "readonly": false
+    }
+  ],
+  "linux": {
+    "security_context": {
+      "run_as_user": {"value": 1002},
+      "run_as_group": {"value": 1002},
+      "readonly_rootfs": false,
+      "privileged": false
+    }
+  }
+}

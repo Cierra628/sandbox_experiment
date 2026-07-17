@@ -1,0 +1,36 @@
+version = 3
+root = "/var/lib/openclaw-kuasar/containerd"
+state = "/run/openclaw-kuasar/containerd-state"
+
+[grpc]
+address = "/run/openclaw-kuasar/containerd.sock"
+
+[plugins.'io.containerd.cri.v1.runtime']
+disable_apparmor = true
+
+[plugins.'io.containerd.cri.v1.runtime'.cni]
+conf_dir = "/etc/openclaw-kuasar/cni"
+bin_dir = "/opt/cni/bin"
+
+[plugins.'io.containerd.cri.v1.runtime'.containerd]
+default_runtime_name = "runc"
+
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc]
+runtime_type = "io.containerd.runc.v2"
+
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.kuasar-runc]
+runtime_type = "io.containerd.kuasar-runc.v1"
+sandboxer = "runc"
+
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.kuasar-vmm]
+runtime_type = "io.containerd.kuasar-vmm.v1"
+sandboxer = "vmm"
+io_type = "streaming"
+
+[proxy_plugins.runc]
+type = "sandbox"
+address = "/run/openclaw-kuasar/runc-sandboxer.sock"
+
+[proxy_plugins.vmm]
+type = "sandbox"
+address = "/run/openclaw-kuasar/vmm-sandboxer.sock"

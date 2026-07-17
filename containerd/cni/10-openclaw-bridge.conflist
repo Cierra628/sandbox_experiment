@@ -1,0 +1,38 @@
+{
+  "cniVersion": "1.0.0",
+  "name": "openclaw-kuasar",
+  "plugins": [
+    {
+      "type": "bridge",
+      "bridge": "openclaw-cni0",
+      "isGateway": true,
+      "ipMasq": true,
+      "hairpinMode": true,
+      "ipam": {
+        "type": "host-local",
+        "ranges": [
+          [
+            {
+              "subnet": "10.86.0.0/16"
+            }
+          ]
+        ],
+        "routes": [
+          {
+            "dst": "0.0.0.0/0"
+          }
+        ]
+      }
+    },
+    {
+      "type": "firewall",
+      "ingressPolicy": "same-bridge"
+    },
+    {
+      "type": "tuning",
+      "sysctl": {
+        "net.ipv6.conf.IFNAME.disable_ipv6": "1"
+      }
+    }
+  ]
+}

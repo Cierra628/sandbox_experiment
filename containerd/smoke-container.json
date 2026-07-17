@@ -1,0 +1,19 @@
+{
+  "metadata": {
+    "name": "busybox-smoke"
+  },
+  "image": {
+    "image": "docker.io/library/busybox:1.36.1"
+  },
+  "command": ["sh", "-c"],
+  "args": ["uname -a; sleep 30"],
+  "working_dir": "/",
+  "log_path": "busybox-smoke.log",
+  "linux": {
+    "security_context": {
+      "run_as_user": {"value": 0},
+      "run_as_group": {"value": 0},
+      "readonly_rootfs": false
+    }
+  }
+}

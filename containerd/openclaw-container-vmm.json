@@ -1,0 +1,58 @@
+{
+  "metadata": {
+    "name": "openclaw-gateway"
+  },
+  "image": {
+    "image": "localhost/openclaw-kuasar:2026.6.11-virtiofs"
+  },
+  "command": [
+    "sh"
+  ],
+  "args": [
+    "-c",
+    "i=0; while [ $i -lt 150 ]; do if [ -f /home/node/.openclaw/openclaw.json ] && [ -d /home/node/.openclaw/state ] && ls /home/node/.openclaw/npm/projects/*/node_modules/@openclaw/deepseek-provider/dist/index.js >/dev/null 2>&1 && touch /home/node/.openclaw/state/.mount-ready && rm -f /home/node/.openclaw/state/.mount-ready; then exec node openclaw.mjs gateway --bind loopback --port 18790; fi; i=$((i+1)); sleep 0.2; done; echo VMM-state-mount-not-ready-within-30s >&2; exit 1"
+  ],
+  "working_dir": "/app",
+  "log_path": "openclaw-gateway.log",
+  "envs": [
+    {
+      "key": "HOME",
+      "value": "/home/node"
+    },
+    {
+      "key": "OPENCLAW_STATE_DIR",
+      "value": "/home/node/.openclaw"
+    },
+    {
+      "key": "OPENCLAW_CONFIG_PATH",
+      "value": "/home/node/.openclaw/openclaw.json"
+    },
+    {
+      "key": "OPENCLAW_DISABLE_BONJOUR",
+      "value": "1"
+    },
+    {
+      "key": "OPENCLAW_GATEWAY_PORT",
+      "value": "18790"
+    }
+  ],
+  "mounts": [
+    {
+      "container_path": "/home/node/.openclaw",
+      "host_path": "/var/lib/openclaw-kuasar/openclaw-state",
+      "readonly": false
+    }
+  ],
+  "linux": {
+    "security_context": {
+      "run_as_user": {
+        "value": 0
+      },
+      "run_as_group": {
+        "value": 0
+      },
+      "readonly_rootfs": false,
+      "privileged": false
+    }
+  }
+}

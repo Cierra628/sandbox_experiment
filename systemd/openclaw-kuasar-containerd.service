@@ -1,0 +1,23 @@
+[Unit]
+Description=OpenClaw experiment isolated containerd
+After=network.target openclaw-kuasar-runc.service openclaw-kuasar-vmm.service
+Requires=openclaw-kuasar-runc.service openclaw-kuasar-vmm.service
+
+[Service]
+Type=notify
+Environment=ENABLE_CRI_SANDBOXES=1
+Environment=HTTP_PROXY=http://127.0.0.1:17890
+Environment=HTTPS_PROXY=http://127.0.0.1:17890
+Environment=ALL_PROXY=http://127.0.0.1:17890
+Environment=NO_PROXY=localhost,127.0.0.1,::1
+Environment=http_proxy=http://127.0.0.1:17890
+Environment=https_proxy=http://127.0.0.1:17890
+Environment=all_proxy=http://127.0.0.1:17890
+Environment=no_proxy=localhost,127.0.0.1,::1
+ExecStart=/usr/local/libexec/openclaw-kuasar/containerd --config /etc/openclaw-kuasar/containerd.toml
+Restart=on-failure
+Delegate=yes
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

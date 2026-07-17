@@ -1,0 +1,15 @@
+{
+  "metadata": {
+    "name": "openclaw",
+    "namespace": "sandbox-experiment",
+    "uid": "openclaw-kuasar-experiment"
+  },
+  "log_directory": "/tmp/openclaw-kuasar-logs",
+  "linux": {
+    "security_context": {
+      "namespace_options": {
+        "network": 2
+      }
+    }
+  }
+}

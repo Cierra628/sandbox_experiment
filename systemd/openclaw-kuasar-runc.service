@@ -1,0 +1,12 @@
+[Unit]
+Description=OpenClaw experiment Kuasar runc sandboxer
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/openclaw-kuasar/runc-sandboxer --listen /run/openclaw-kuasar/runc-sandboxer.sock --dir /var/lib/openclaw-kuasar/runc
+Restart=on-failure
+Delegate=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=OpenClaw experiment Kuasar Cloud Hypervisor sandboxer
+After=network.target
+ConditionPathExists=/dev/kvm
+
+[Service]
+Type=notify
+ExecStart=/usr/local/libexec/openclaw-kuasar/vmm-sandboxer --config /etc/openclaw-kuasar/vmm.toml --listen /run/openclaw-kuasar/vmm-sandboxer.sock --admin-listen /run/openclaw-kuasar/vmm-admin.sock --dir /var/lib/openclaw-kuasar/vmm
+Restart=on-failure
+Delegate=yes
+LimitNOFILE=1048576
+LimitNPROC=infinity
+
+[Install]
+WantedBy=multi-user.target

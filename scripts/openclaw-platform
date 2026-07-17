@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$ROOT_DIR/config/versions.env"
+STATE_DIR="$ROOT_DIR/.state"
+STATE_FILE="$STATE_DIR/runtime.json"
+ARTIFACT_ROOT="$ROOT_DIR/.artifacts"
+DATA_DIR="${OPENCLAW_DATA_DIR:-$HOME/.local/share/openclaw-kuasar/openclaw-state}"
+HANDLER="${OPENCLAW_RUNTIME_HANDLER:-$RUNTIME_HANDLER}"
+CRI=(sudo crictl --runtime-endpoint "$CRI_ENDPOINT" --image-endpoint "$CRI_ENDPOINT")
+POD_ID=''
+CONTAINER_ID=''
+CLOUD_HYPERVISOR_PID=''
+DEPLOYED_AT=''
+
+usage() {
+  cat <<'EOF_HELP'
+OpenClaw Kuasar platform
+
+Commands:
+  deploy  start the OpenClaw gateway through the kuasar-vmm handler
+  status  reconcile runtime, CRI, gateway, and Cloud Hypervisor state
+  logs    show redacted OpenClaw and Kuasar service logs
+  demo    run one fixed OpenClaw agent request in the guest
+  delete  stop and remove the experiment resources (idempotent)
+EOF_HELP
+}
+
+require_vmm_handler() {
+  if [ "$HANDLER" != "kuasar-vmm" ]; then
+    echo 'error: kuasar-vmm is required; fallback is disabled' >&2
+    exit 2
+  fi
+}
+
+load_state() {
+  [ -f "$STATE_FILE" ] || return 1
+  POD_ID="$(jq -er '.pod_id' "$STATE_FILE")"
+  CONTAINER_ID="$(jq -er '.container_id' "$STATE_FILE")"
+  CLOUD_HYPERVISOR_PID="$(jq -er '.cloud_hypervisor_pid // empty' "$STATE_FILE" || true)"
+  DEPLOYED_AT="$(jq -er '.deployed_at // empty' "$STATE_FILE" || true)"
+}
+
+redact() {
+  sed -E 's/((token|password|secret|api[_-]?key|authorization)[[:space:]]*[=:]?[[:space:]]*)[^[:space:]]+/\1<redacted>/Ig'
+}
+
+new_artifact_dir() {
+  local dir="$ARTIFACT_ROOT/$(date -u +%Y%m%dT%H%M%SZ)"
+  mkdir -p "$dir"
+  printf '%s\n' "$dir"
+}
+
+capture_diagnostics() {
+  local dir="$1"
+  set +e
+  { "${CRI[@]}" pods; "${CRI[@]}" ps -a; } 2>&1 | redact > "$dir/cri.txt"
+  sudo journalctl -u openclaw-kuasar-vmm.service --since '-10 min' --no-pager 2>&1 | redact > "$dir/vmm-journal.txt"
+  sudo journalctl -u openclaw-kuasar-containerd.service --since '-10 min' --no-pager 2>&1 | redact > "$dir/containerd-journal.txt"
+  pgrep -af cloud-hypervisor > "$dir/cloud-hypervisor.txt" 2>&1 || true
+}
+
+cleanup_partial() {
+  set +e
+  [ -n "$CONTAINER_ID" ] && "${CRI[@]}" stop "$CONTAINER_ID" >/dev/null 2>&1
+  [ -n "$CONTAINER_ID" ] && "${CRI[@]}" rm "$CONTAINER_ID" >/dev/null 2>&1
+  [ -n "$POD_ID" ] && "${CRI[@]}" stopp "$POD_ID" >/dev/null 2>&1
+  [ -n "$POD_ID" ] && "${CRI[@]}" rmp "$POD_ID" >/dev/null 2>&1
+}
+
+ensure_preconditions() {
+  [ -d "$DATA_DIR" ] || { echo "error: state directory is missing: $DATA_DIR" >&2; return 1; }
+  [ -f "$DATA_DIR/openclaw.json" ] || { echo 'error: state directory lacks openclaw.json' >&2; return 1; }
+  sudo test -r /dev/kvm -a -w /dev/kvm || { echo 'error: /dev/kvm is not readable and writable by the runtime context' >&2; return 1; }
+  sudo systemctl is-active --quiet openclaw-kuasar-runc.service || { echo 'error: Kuasar runc sandboxer is not active' >&2; return 1; }
+  sudo systemctl is-active --quiet openclaw-kuasar-vmm.service || { echo 'error: Kuasar VMM sandboxer is not active' >&2; return 1; }
+  sudo systemctl is-active --quiet openclaw-kuasar-containerd.service || { echo 'error: isolated containerd is not active' >&2; return 1; }
+  "${CRI[@]}" info >/dev/null
+  test -x /usr/local/libexec/openclaw-kuasar/vmm-sandboxer
+  test -x /usr/local/libexec/openclaw-kuasar/cloud-hypervisor
+  "${CRI[@]}" images --digests | grep -F 'ghcr.io/openclaw/openclaw' >/dev/null
+}
+
+image_digest() {
+  local line
+  line="$("${CRI[@]}" images --digests 2>/dev/null | grep -F 'ghcr.io/openclaw/openclaw' | head -n1 || true)"
+  if [[ "$line" =~ sha256:[0-9a-f]{64} ]]; then
+    printf '%s\n' "${BASH_REMATCH[0]}"
+  else
+    printf '%s\n' unknown
+  fi
+}
+
+wait_for_gateway() {
+  local timeout="${OPENCLAW_HEALTH_TIMEOUT:-120}"
+  local i
+  for ((i=0; i<timeout; i++)); do
+    if "${CRI[@]}" exec "$CONTAINER_ID" openclaw gateway health >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+deploy() {
+  require_vmm_handler
+  if [ "${PLATFORM_DRY_RUN:-0}" = 1 ]; then
+    printf '%s\n' "DRY RUN: handler=$HANDLER" "DRY RUN: endpoint=$CRI_ENDPOINT" "DRY RUN: data=$DATA_DIR" 'DRY RUN: generate specs -> runp -> create -> start -> health check'
+    return 0
+  fi
+  ensure_preconditions
+  DEPLOYED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  OPENCLAW_DATA_DIR="$DATA_DIR" "$ROOT_DIR/scripts/03-generate-cri-specs.sh" >/dev/null
+  local artifact_dir state_tmp digest ready_at pid
+  artifact_dir="$(new_artifact_dir)"
+  trap 'capture_diagnostics "$artifact_dir"; cleanup_partial' ERR
+  POD_ID="$("${CRI[@]}" runp --runtime "$HANDLER" "$ROOT_DIR/containerd/openclaw-pod.json")"
+  CONTAINER_ID="$("${CRI[@]}" create "$POD_ID" "$ROOT_DIR/containerd/openclaw-container.json" "$ROOT_DIR/containerd/openclaw-pod.json")"
+  "${CRI[@]}" start "$CONTAINER_ID" >/dev/null
+  wait_for_gateway
+  ready_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  pid="$(pgrep -f '/usr/local/libexec/openclaw-kuasar/cloud-hypervisor' | head -n1 || true)"
+  digest="$(image_digest)"
+  mkdir -p "$STATE_DIR"
+  state_tmp="$STATE_FILE.tmp.$$"
+  jq -n --arg pod "$POD_ID" --arg container "$CONTAINER_ID" --arg handler "$HANDLER" \
+    --arg image "$OPENCLAW_IMAGE" --arg digest "$digest" --arg pid "$pid" \
+    --arg deployed "$DEPLOYED_AT" --arg ready "$ready_at" \
+    '{pod_id:$pod,container_id:$container,runtime_handler:$handler,image:$image,image_digest:$digest,cloud_hypervisor_pid:($pid|if .=="" then null else tonumber end),deployed_at:$deployed,ready_at:$ready}' > "$state_tmp"
+  mv -f "$state_tmp" "$STATE_FILE"
+  trap - ERR
+  DEPLOYED_AT="$(jq -r '.deployed_at' "$STATE_FILE")"
+  printf '%s\n' "deployed pod=$POD_ID container=$CONTAINER_ID handler=$HANDLER" "state=$STATE_FILE"
+}
+
+status() {
+  local handler_state='FAIL' cri_state='FAIL' vmm_state='FAIL' ch_state='FAIL' gateway_state='FAIL'
+  local state_info='none'
+  if [ -f "$STATE_FILE" ]; then
+    state_info="pod=$(jq -r '.pod_id' "$STATE_FILE") container=$(jq -r '.container_id' "$STATE_FILE")"
+    handler_state="$(jq -r '.runtime_handler' "$STATE_FILE" | grep -qx kuasar-vmm && echo PASS || echo FAIL)"
+    load_state || true
+    if "${CRI[@]}" inspect "$CONTAINER_ID" >/dev/null 2>&1; then cri_state=PASS; fi
+    if "${CRI[@]}" exec "$CONTAINER_ID" openclaw gateway health >/dev/null 2>&1; then gateway_state=PASS; fi
+  fi
+  if sudo systemctl is-active --quiet openclaw-kuasar-vmm.service 2>/dev/null; then vmm_state=PASS; fi
+  if "${CRI[@]}" info >/dev/null 2>&1; then cri_state=PASS; fi
+  if pgrep -f '/usr/local/libexec/openclaw-kuasar/cloud-hypervisor' >/dev/null 2>&1; then ch_state=PASS; fi
+  printf 'runtime_handler=%s %s\n' "$HANDLER" "$handler_state"
+  printf 'containerd_cri=%s\n' "$cri_state"
+  printf 'vmm_sandboxer=%s\n' "$vmm_state"
+  printf 'cloud_hypervisor=%s\n' "$ch_state"
+  printf 'openclaw_gateway=%s\n' "$gateway_state"
+  printf 'state=%s\n' "$state_info"
+}
+
+logs() {
+  load_state || { echo 'error: no deployed runtime state' >&2; exit 1; }
+  local since="${DEPLOYED_AT:-'-10 min'}"
+  printf '%s\n' '--- openclaw container ---'
+  "${CRI[@]}" logs "$CONTAINER_ID" 2>&1 | redact
+  printf '%s\n' '--- kuasar vmm ---'
+  sudo journalctl -u openclaw-kuasar-vmm.service --since "$since" --no-pager 2>&1 | redact
+  printf '%s\n' '--- isolated containerd ---'
+  sudo journalctl -u openclaw-kuasar-containerd.service --since "$since" --no-pager 2>&1 | redact
+}
+
+demo() {
+  load_state || { echo 'error: no deployed runtime state' >&2; exit 1; }
+  local start end result guest
+  start="$(date +%s%3N)"
+  result="$("${CRI[@]}" exec "$CONTAINER_ID" openclaw agent --agent main --session-key agent:main:kuasar-demo --message 'Read the current runtime environment and produce a short status report.' --timeout 180 --json)"
+  end="$(date +%s%3N)"
+  guest="$("${CRI[@]}" exec "$CONTAINER_ID" uname -a 2>/dev/null || true)"
+  printf '%s\n' "$result"
+  printf 'runtime_handler=%s\ncloud_hypervisor_pid=%s\nimage_digest=%s\nfirst_response_ms=%s\nguest_uname=%s\n' \
+    "$HANDLER" "$(jq -r '.cloud_hypervisor_pid // "unknown"' "$STATE_FILE")" "$(jq -r '.image_digest' "$STATE_FILE")" "$((end-start))" "$guest"
+}
+
+delete_runtime() {
+  if ! load_state; then
+    echo 'No deployed experiment state; delete is already complete.'
+    return 0
+  fi
+  cleanup_partial
+  if [ -n "$CLOUD_HYPERVISOR_PID" ]; then
+    for _ in $(seq 1 30); do
+      kill -0 "$CLOUD_HYPERVISOR_PID" 2>/dev/null || break
+      sleep 1
+    done
+  fi
+  if ! "${CRI[@]}" inspect "$CONTAINER_ID" >/dev/null 2>&1 && ! "${CRI[@]}" inspectp "$POD_ID" >/dev/null 2>&1; then
+    rm -f "$STATE_FILE"
+    echo 'Deleted OpenClaw experiment resources.'
+  else
+    echo 'error: resources still present; state retained for reconciliation' >&2
+    return 1
+  fi
+}
+
+command="${1:-help}"
+case "$command" in
+  help|-h|--help) usage ;;
+  deploy) deploy ;;
+  status) status ;;
+  logs) logs ;;
+  demo) demo ;;
+  delete) delete_runtime ;;
+  *) echo "error: unknown command: $command" >&2; usage >&2; exit 2 ;;
+esac
