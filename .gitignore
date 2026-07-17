@@ -3,3 +3,5 @@
 .artifacts/
 .secrets/
 images/openclaw/*.tar
+
+HANDOFF.md
