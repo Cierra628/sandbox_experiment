@@ -1,144 +1,174 @@
 # OpenClaw + Kuasar + Cloud Hypervisor 实验平台
 
-本目录提供一个可重复的基础平台，用于展示同一个 OpenClaw Gateway 在普通 `runc`、Kuasar runc sandboxer 和 Kuasar VMM（Cloud Hypervisor）上的运行链路。
+本项目在不替换主机现有 containerd/Kata 配置的前提下，搭建了一套隔离的
+containerd v2 + Kuasar v1.1.0 平台，并在三种 runtime 上运行同一个
+OpenClaw 2026.6.11 样例：
 
-```text
-openclaw-platform -> CRI -> 隔离 containerd v2 -> Kuasar sandboxer -> Cloud Hypervisor -> OpenClaw
-```
+    OpenClaw
+      -> CRI
+      -> 隔离 containerd
+      -> runc / Kuasar runc / Kuasar VMM
+      -> Cloud Hypervisor（VMM 路径）
 
-实验运行时使用专用 socket `unix:///run/openclaw-kuasar/containerd.sock`，不会替换主机已有的 `/usr/bin/containerd`、`/etc/containerd/config.toml` 或 Kata 配置。
+专用 CRI endpoint：
 
-## 当前状态（2026-07-16）
+    unix:///run/openclaw-kuasar/containerd.sock
 
-- 主机 OpenClaw Gateway：PASS（`127.0.0.1:18789`）
-- 普通 `runc`：PASS，容器内 Gateway 健康检查 `ok: true`
-- `kuasar-runc`：PASS，容器内 Gateway 健康检查 `ok: true`
-- `kuasar-vmm`：PASS；正式容器持续 RUNNING，Gateway health 稳定，DeepSeek 固定样例返回 `KUASAR_SAMPLE_OK`
-- DeepSeek 固定样例：PASS，精确返回 `KUASAR_SAMPLE_OK`
-- 三种 runtime 的分阶段耗时 breakdown：PASS；完整结果见 [`docs/2026-07-17-runtime-breakdown.md`](docs/2026-07-17-runtime-breakdown.md)
+## 当前状态（2026-07-17）
 
-Breakdown 脚本：`scripts/08-benchmark-runtimes.sh`。默认每种 runtime 三轮且不调用模型；设置 `MODEL_SAMPLE_RUNS=1` 时，每种 runtime 的第一轮额外运行一次固定 DeepSeek 样例。
+所有功能 gate 和 breakdown 均已完成：
 
-完整诊断状态和上下文压缩恢复入口见 [`HANDOFF.md`](HANDOFF.md)。VMM 的 cpuset、virtiofs SQLite、状态权限、插件认证和 CNI 网络问题均已解决；当前工作已转入性能 breakdown。
+| 项目 | 状态 |
+| --- | --- |
+| 主机 OpenClaw Gateway | PASS |
+| 普通 runc + OpenClaw | PASS |
+| Kuasar runc + OpenClaw | PASS |
+| Kuasar VMM + Cloud Hypervisor + OpenClaw | PASS |
+| Gateway health | PASS |
+| DeepSeek 固定样例 | 9/9 PASS |
+| 三种 runtime 分阶段 breakdown | PASS |
+
+九次模型调用全部精确返回 KUASAR_SAMPLE_OK，使用
+deepseek/deepseek-v4-flash，且没有 fallback。
+
+完整实验结论见
+[docs/2026-07-17-runtime-breakdown.md](docs/2026-07-17-runtime-breakdown.md)，
+故障处理与上下文恢复见 [HANDOFF.md](HANDOFF.md)。
+
+## 最终性能结果
+
+基础设施测试每种 runtime 三轮：
+
+| 指标 | runc | Kuasar runc | Kuasar VMM |
+| --- | ---: | ---: | ---: |
+| Gateway ready | 4.210 s | 4.207 s | 40.130 s |
+| health exec | 3.362 s | 3.399 s | 32.870 s |
+| 基础流程 total | 8.137 s | 8.195 s | 74.127 s |
+
+固定模型样例每种 runtime 三轮：
+
+| 指标 | runc | Kuasar runc | Kuasar VMM |
+| --- | ---: | ---: | ---: |
+| sample exec 平均 | 5.775 s | 6.030 s | 48.312 s |
+| sample 范围 | 5.733--5.802 s | 5.915--6.243 s | 46.457--50.468 s |
+| 全流程平均 | 13.949 s | 14.213 s | 119.371 s |
+
+Kuasar runc 与普通 runc 接近。Kuasar VMM 的 sample exec 是 runc 的
+8.37 倍，全流程是 8.56 倍。VMM 的 exec true 仅约 70 ms、Node probe
+约 125 ms，因此瓶颈不在普通 CRI exec/vsock，而集中在 guest 内 OpenClaw
+初始化、插件发现、SQLite 状态访问和 virtiofs 元数据 I/O。
 
 ## 固定版本
 
+- OpenClaw：2026.6.11
 - Kuasar：v1.1.0
 - Cloud Hypervisor：v52.0
-- OpenClaw 镜像：`ghcr.io/openclaw/openclaw:2026.6.11`
-- Pause 镜像：`registry.k8s.io/pause:3.10`
-- 最终 handler：`kuasar-vmm`（禁止静默回退到 runc）
+- 最终 OpenClaw 镜像：localhost/openclaw-kuasar:2026.6.11-virtiofs
+- Pause 镜像：registry.k8s.io/pause:3.10
+- VMM：2 vCPU、2048 MiB、cold boot、virtiofs
+- CNI IPv4 网段：10.86.0.0/16
 
-哈希、下载地址和 CRI endpoint 统一在 [`config/versions.env`](config/versions.env) 中维护。
+下载地址、校验值和 CRI endpoint 位于 config/versions.env。
 
-## 从零部署工作流
+## 从零部署
 
-先做只读预检和源码测试：
+先执行只读预检和静态测试：
 
-```bash
-./scripts/00-check-host.sh
-bash tests/test-runtime-config.sh
-bash tests/test-cri-specs.sh
-bash tests/test-platform-cli.sh
-```
+    ./scripts/00-check-host.sh
+    bash tests/test-runtime-config.sh
+    bash tests/test-cri-specs.sh
+    bash tests/test-platform-cli.sh
+    bash tests/test-openclaw-virtiofs-image.sh
 
-准备运行时文件（下载写入项目 `.cache/`，不会修改系统）：
+下载并安装隔离 runtime：
 
-```bash
-./scripts/05-fetch-runtime.sh
-```
+    ./scripts/05-fetch-runtime.sh
+    sudo ./scripts/06-install-runtime.sh
 
-安装步骤会写 `/usr/local/libexec/openclaw-kuasar`、`/etc/openclaw-kuasar`、`/var/lib/openclaw-kuasar`，并安装三个 systemd 服务：
+准备 OpenClaw 状态：
 
-```bash
-sudo ./scripts/06-install-runtime.sh
-```
+    ./scripts/07-prepare-openclaw-state.sh
 
-准备不暴露凭据的 OpenClaw 状态副本：
+构建或导入派生镜像，并生成 CRI specs：
 
-```bash
-./scripts/07-prepare-openclaw-state.sh
-```
+    RUN_CRICTL=1 ./scripts/02-build-openclaw-image.sh
+    OPENCLAW_DATA_DIR="$HOME/.local/share/openclaw-kuasar/openclaw-state" \
+      ./scripts/03-generate-cri-specs.sh
 
-拉取镜像并生成 CRI 规格：
+服务安装后应全部为 active：
 
-```bash
-RUN_CRICTL=1 ./scripts/02-build-openclaw-image.sh
-OPENCLAW_DATA_DIR="$HOME/.local/share/openclaw-kuasar/openclaw-state" \
-  ./scripts/03-generate-cri-specs.sh
-```
+    sudo systemctl is-active \
+      openclaw-kuasar-runc.service \
+      openclaw-kuasar-vmm.service \
+      openclaw-kuasar-containerd.service
 
-若 registry 直连失败，当前可用主机代理为 `127.0.0.1:17890`。Pause 镜像此前通过以下方式成功拉入专用 containerd：
+## 运行单个 runtime
 
-```bash
-sudo env \
-  HTTP_PROXY=http://127.0.0.1:17890 \
-  HTTPS_PROXY=http://127.0.0.1:17890 \
-  http_proxy=http://127.0.0.1:17890 \
-  https_proxy=http://127.0.0.1:17890 \
-  ALL_PROXY= all_proxy= \
-  NO_PROXY=localhost,127.0.0.1,::1 \
-  no_proxy=localhost,127.0.0.1,::1 \
-  ctr --address /run/openclaw-kuasar/containerd.sock \
-  --namespace k8s.io images pull \
-  --platform linux/amd64 \
-  registry.k8s.io/pause:3.10
-```
+    OPENCLAW_RUNTIME_HANDLER=runc AUTO_CLEANUP=0 RUN_CRICTL=1 \
+      ./scripts/04-run-with-crictl.sh
 
-## 平台 CLI
+    OPENCLAW_RUNTIME_HANDLER=kuasar-runc AUTO_CLEANUP=0 RUN_CRICTL=1 \
+      ./scripts/04-run-with-crictl.sh
 
-```bash
-./scripts/openclaw-platform deploy
-./scripts/openclaw-platform status
-./scripts/openclaw-platform demo
-./scripts/openclaw-platform logs
-./scripts/openclaw-platform delete
-```
+    OPENCLAW_RUNTIME_HANDLER=kuasar-vmm AUTO_CLEANUP=0 RUN_CRICTL=1 \
+      ./scripts/04-run-with-crictl.sh
 
-`demo` 会在 VMM guest 内执行固定的 OpenClaw agent 请求，并记录 handler、Cloud Hypervisor PID、镜像 digest、guest `uname -a` 和响应耗时；不会打印环境变量或配置文件。
+健康检查：
 
-## 运行时 gate
+    EP=unix:///run/openclaw-kuasar/containerd.sock
+    CID=$(jq -r .container_id .state/last-run.json)
+    sudo crictl --runtime-endpoint "$EP" --image-endpoint "$EP" \
+      exec "$CID" node openclaw.mjs gateway health --json
 
-直接运行单个 handler：
+## 重复 breakdown
 
-```bash
-OPENCLAW_RUNTIME_HANDLER=runc AUTO_CLEANUP=0 RUN_CRICTL=1 \
-  ./scripts/04-run-with-crictl.sh
+只测试基础设施，每种 runtime 三轮：
 
-OPENCLAW_RUNTIME_HANDLER=kuasar-runc AUTO_CLEANUP=0 RUN_CRICTL=1 \
-  ./scripts/04-run-with-crictl.sh
+    BENCHMARK_RUNS=3 MODEL_SAMPLE_RUNS=0 \
+      ./scripts/08-benchmark-runtimes.sh
 
-OPENCLAW_RUNTIME_HANDLER=kuasar-vmm AUTO_CLEANUP=0 RUN_CRICTL=1 \
-  ./scripts/04-run-with-crictl.sh
-```
+基础设施和模型样例均测试三轮：
 
-容器内健康检查：
+    BENCHMARK_RUNS=3 MODEL_SAMPLE_RUNS=3 \
+      ./scripts/08-benchmark-runtimes.sh
 
-```bash
-EP=unix:///run/openclaw-kuasar/containerd.sock
-CID=$(jq -r .container_id .state/last-run.json)
-sudo crictl --runtime-endpoint "$EP" --image-endpoint "$EP" \
-  exec "$CID" node openclaw.mjs gateway health --json
-```
+结果写入 .artifacts/breakdown-*/results.json 和 summary.json。
+.artifacts 已被 Git 忽略；整理后的实验报告保存在 docs 中。
 
-最终验收需要完成普通 runc baseline、`kuasar-runc`、`kuasar-vmm`，并连续执行三轮 `deploy -> demo -> delete`。未完成前，不把“脚本已就绪”表述为“VMM 已跑通”。
+## 已解决的关键兼容问题
 
-## 当前 VMM 诊断
+- registry reset/EOF：通过主机 HTTP 代理完成镜像拉取。
+- runc sandboxer systemd 超时：服务类型改为 simple。
+- host UTS/PID/IPC 导致的 namespace 错误：使用正确 Pod namespace。
+- 主机与容器端口冲突：容器 Gateway 攏到 18790。
+- Kuasar virtio-blk guest mount EIO：切换为 virtiofs。
+- youki cpuset controller 错误：移除会触发旧 OCI 兼容问题的 CRI resources。
+- Node SQLite WAL 在 virtiofs 上返回 SQLITE_IOERR_SHMMAP：派生 OpenClaw
+  镜像，将网络文件系统改用 rollback journal。
+- VMM 状态目录 UID/权限问题：VMM 使用专用 root-owned 状态目录和 spec。
+- DeepSeek plugin/auth：在 VMM 状态目录中注册插件并规范化 SQLite journal。
+- VMM 无网络：启用独立 IPv4 CNI、DNS、NAT 和 firewall forwarding。
 
-cpuset workaround 已实测使 VMM 容器进入 RUNNING。当前剩余边界是 Node SQLite WAL/SHM/锁在 virtiofs 上返回 EIO；普通 write、fsync、rename、unlink 均已在同一 sandbox 中验证成功。不要先增加内存、反复清理状态目录或回退 virtio-blk。下一步按 [`HANDOFF.md`](HANDOFF.md) 运行最小 Node SQLite WAL 事务，再决定 guest-local state storage 或进一步调查 OpenClaw SQLite 初始化。
+## 数据与凭据边界
 
-## 网络代理说明
+以下路径不会进入 Git：
 
-隔离 containerd systemd 单元显式使用当前代理 `127.0.0.1:17890`。若代理端口改变，请同步修改 `systemd/openclaw-kuasar-containerd.service`，执行 `systemctl daemon-reload`，然后只重启实验 containerd。主机原有 containerd 不使用此实验单元的代理设置。
+- .cache/：运行时二进制、内核和 VM 镜像
+- .state/：临时 runtime ID
+- .artifacts/：原始 benchmark JSON 和日志
+- .secrets/：本地秘密
+- images/openclaw/*.tar：导出的镜像
 
-## 凭据和回滚
+主机凭据只存在于仓库外的 OpenClaw 状态目录，不应复制到文档、镜像层或
+Git 历史中。当前工作目录约 317 MB，但排除上述忽略项后，源码与文档约
+300 KB。
 
-主机凭据只从 `$HOME/.openclaw` 复制到 `$HOME/.local/share/openclaw-kuasar/openclaw-state`（权限 0700），不进入仓库、镜像层或诊断归档。
+## 回滚
 
-回滚只停用实验服务，不自动删除运行时数据：
+回滚只停止实验服务，不删除主机现有 containerd/Kata：
 
-```bash
-sudo systemctl disable --now openclaw-kuasar-containerd.service \
-  openclaw-kuasar-vmm.service openclaw-kuasar-runc.service
-sudo systemctl daemon-reload
-```
+    sudo systemctl disable --now \
+      openclaw-kuasar-containerd.service \
+      openclaw-kuasar-vmm.service \
+      openclaw-kuasar-runc.service
+    sudo systemctl daemon-reload
