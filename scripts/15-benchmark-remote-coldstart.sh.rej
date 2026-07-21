@@ -1,0 +1,4 @@
+diff a/scripts/15-benchmark-remote-coldstart.sh b/scripts/15-benchmark-remote-coldstart.sh	(rejected hunks)
+@@ -173,1 +173,1 @@
+-root_bytes() { du -sb "$CT_ROOT" 2>/dev/null | awk '{print $1}'; }
++root_bytes() { sudo du -sb "$CT_ROOT" 2>/dev/null | awk '{print $1}'; }

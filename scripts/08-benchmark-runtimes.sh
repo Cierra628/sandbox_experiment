@@ -6,6 +6,8 @@ CRI_ENDPOINT="${CRI_ENDPOINT:-unix:///run/openclaw-kuasar/containerd.sock}"
 HANDLERS="${BENCHMARK_HANDLERS:-runc kuasar-runc kuasar-vmm}"
 RUNS="${BENCHMARK_RUNS:-3}"
 MODEL_SAMPLE_RUNS="${MODEL_SAMPLE_RUNS:-0}"
+MODEL_SAMPLE_MESSAGE="${MODEL_SAMPLE_MESSAGE:-Reply with exactly KUASAR_SAMPLE_OK and nothing else.}"
+MODEL_SAMPLE_EXPECTED="${MODEL_SAMPLE_EXPECTED:-KUASAR_SAMPLE_OK}"
 READY_TIMEOUT="${READY_TIMEOUT:-180}"
 OPENCLAW_DATA_DIR="${OPENCLAW_DATA_DIR:-$HOME/.local/share/openclaw-kuasar/openclaw-state}"
 RESULT_DIR="${RESULT_DIR:-$ROOT_DIR/.artifacts/breakdown-$(date -u +%Y%m%dT%H%M%SZ)}"
@@ -46,8 +48,8 @@ run_once(){
   else end="$(now_ms)"; gateway_ready_ms="$((end-ready_begin))"; status=FAIL; note=gateway-not-ready; fi
  fi
  if [ "$status" = PASS ] && [ "$run" -le "$MODEL_SAMPLE_RUNS" ]; then
-  if timed_capture output sample_exec_ms "${CRI[@]}" exec "$cid" node openclaw.mjs agent --local --agent main --session-key "agent:main:breakdown-${handler}-${run}-$(date +%s)" --message 'Reply with exactly KUASAR_SAMPLE_OK and nothing else.' --timeout 180 --json; then
-   printf '%s\n' "$output" > "$RESULT_DIR/${handler}-run${run}-sample.json"; sample_internal_ms="$(jq -r '.meta.durationMs//0' <<<"$output")"; [ "$(jq -r '.payloads[0].text//""' <<<"$output")" = KUASAR_SAMPLE_OK ] || { status=FAIL; note=sample-output-mismatch; }
+  if timed_capture output sample_exec_ms "${CRI[@]}" exec "$cid" node openclaw.mjs agent --local --agent main --session-key "agent:main:breakdown-${handler}-${run}-$(date +%s)" --message "$MODEL_SAMPLE_MESSAGE" --timeout 180 --json; then
+   printf '%s\n' "$output" > "$RESULT_DIR/${handler}-run${run}-sample.json"; sample_internal_ms="$(jq -r '.meta.durationMs//0' <<<"$output")"; [ "$(jq -r '.payloads[0].text//""' <<<"$output")" = "$MODEL_SAMPLE_EXPECTED" ] || { status=FAIL; note=sample-output-mismatch; }
   else status=FAIL; note=sample-exec-failed; fi
  fi
  [ -z "$cid" ] || "${CRI[@]}" logs "$cid" > "$RESULT_DIR/${handler}-run${run}.log" 2>&1 || true

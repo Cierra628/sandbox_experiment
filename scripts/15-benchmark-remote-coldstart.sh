@@ -137,7 +137,19 @@ timed() {
 }
 
 json_from_output() {
-  awk 'BEGIN{found=0} !found && $0 ~ /^[[:space:]]*\{/ {found=1} found{print}'
+  awk '
+    BEGIN { found=0; first=0; last=0 }
+    !found && $0 ~ /^[[:space:]]*\{/ { found=1; first=NR }
+    found {
+      lines[NR]=$0
+      if ($0 ~ /^[[:space:]]*}$/) last=NR
+    }
+    END {
+      if (!found) exit 1
+      if (last == 0) last=NR
+      for (i=first; i<=last; i++) print lines[i]
+    }
+  '
 }
 
 workloads_present() {
@@ -149,9 +161,18 @@ workloads_present() {
   return 1
 }
 
+vmm_workload_lines() {
+  local listing="${1:-}"
+  if [ -z "$listing" ]; then
+    listing="$(ps -eo pid=,args=)"
+  fi
+  printf '%s\n' "$listing" |
+    awk '/\/var\/lib\/openclaw-kuasar\/vmm\// && /(cloud-hypervisor|virtiofsd)/ { print }'
+}
+
 assert_empty() {
   workloads_present && die 'active CRI container or pod remains'
-  pgrep -af 'cloud-hypervisor|virtiofsd' >/dev/null 2>&1 &&
+  [ -z "$(vmm_workload_lines)" ] ||
     die 'Cloud Hypervisor or virtiofsd workload remains'
 }
 
@@ -161,7 +182,7 @@ image_present() {
     awk -v ref="$image" '$1==ref{found=1} END{exit found?0:1}'
 }
 
-root_bytes() { du -sb "$CT_ROOT" 2>/dev/null | awk '{print $1}'; }
+root_bytes() { sudo du -sb "$CT_ROOT" 2>/dev/null | awk '{print $1}'; }
 
 stop_stack() {
   sudo systemctl stop "$CONTAINERD_SERVICE" || true
@@ -215,9 +236,8 @@ discard_backup() {
 }
 
 pull_one() {
-  local image="$1" out_var="$2" ms_var="$3" out rc
-  if timed out "$ms_var" "${CRI[@]}" pull --pull-timeout "$PULL_TIMEOUT" "$image"; then rc=0; else rc=$?; fi
-  printf -v "$out_var" '%s' "$captured"
+  local image="$1" out_var="$2" ms_var="$3" rc
+  if timed "$out_var" "$ms_var" "${CRI[@]}" pull --pull-timeout "$PULL_TIMEOUT" "$image"; then rc=0; else rc=$?; fi
   return "$rc"
 }
 

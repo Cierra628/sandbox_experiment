@@ -1,0 +1,19 @@
+{
+  "id": "image-upscale",
+  "name": "Image Upscale Benchmark",
+  "description": "Upscale a deterministic local PGM image with a reproducible CPU workload.",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "image_upscale"
+    ]
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "openclaw-plugin-image-upscale-benchmark",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "files": [
+    "image-upscale.mjs",
+    "index.mjs",
+    "openclaw.plugin.json",
+    "package.json"
+  ],
+  "peerDependencies": {
+    "openclaw": ">=2026.6.11"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.mjs"
+    ]
+  }
+}
