@@ -280,6 +280,49 @@ artifact：`.artifacts/image-workload-20260721T071440Z`。9/9 PASS，每种 hand
 
 图片工具本身三条路径均约 87--91 ms；VMM 只有约 1.04 倍于 runc。VMM 的 Gateway、health 和 Agent 仍分别约为 38.0、31.7 和 54.5 秒，说明复杂 workload 没有改变瓶颈位置。相比控制样例，复杂 workload 的 Agent internal 增加，是模型决定工具、工具结果回传和 session 收尾的综合成本，不能等同于图片算法的 CPU 时间。
 
+### 8.3 Agent sample exec wall 与 Agent internal 的差值
+
+这两个指标的关系与 health 的外层 wall/internal 类似，但当前脚本没有给 Agent CLI
+启动过程加更细的时间戳，因此两者的差值只能作为**派生的外层残差**，不能直接命名为
+某一个单独阶段：
+
+```text
+agent_sample_exec_wall
+  = CRI exec/Guest transport
+  + 新 OpenClaw CLI 的启动、配置/插件/session/auth/state bootstrap
+  + Agent internal
+  + JSON 序列化、输出和 CLI 退出
+```
+
+其中 `agent_internal` 是 Agent JSON 的 `meta.durationMs`，从 embedded Agent runtime开始计时，包含 provider/模型请求以及复杂 workload 中的工具选择和工具调用；它不包含外层 CLI 启动、CRI exec、状态准备和进程退出。因此 `agent_sample_exec_wall - agent_internal` 不是纯粹的 runtime 延迟，也不能直接当成模型请求时间。
+
+| 实验组 / handler | Agent exec wall | Agent internal | 派生外层残差 | 残差占 exec wall |
+| --- | ---: | ---: | ---: | ---: |
+| 缓存基线 / runc | 6,073 ms | 2,270 ms | **3,803 ms** | 62.6% |
+| 缓存基线 / kuasar-runc | 6,435 ms | 2,642 ms | **3,793 ms** | 58.9% |
+| 缓存基线 / kuasar-vmm | 47,936 ms | 9,244 ms | **38,692 ms** | 80.7% |
+| 远端冷拉取 / runc | 5,885 ms | 2,140 ms | **3,745 ms** | 63.6% |
+| 远端冷拉取 / kuasar-runc | 5,911 ms | 2,149 ms | **3,762 ms** | 63.6% |
+| 远端冷拉取 / kuasar-vmm | 47,357 ms | 9,316 ms | **38,041 ms** | 80.3% |
+| 图片 workload / runc | 8,123 ms | 4,231 ms | **3,892 ms** | 47.9% |
+| 图片 workload / kuasar-runc | 8,068 ms | 4,272 ms | **3,796 ms** | 47.0% |
+| 图片 workload / kuasar-vmm | 54,537 ms | 14,442 ms | **40,095 ms** | 73.5% |
+
+这张表可以这样读：
+
+1. 普通 runc 和 Kuasar runc 的外层残差在控制样例、远端拉取样例中都稳定在约
+   3.75--3.80 秒；因此远端 Registry 的 pull 不会进入 Agent sample 阶段，外层差值
+   主要是 CLI/session/auth/state bootstrap、CRI/transport 和退出收尾。
+2. VMM 的外层残差上升到约 38--40 秒，且比 Agent internal 本身的增量更大。以缓存
+   基线为例，VMM 相对 runc 的 exec wall 多 41.862 秒，其中约 34.889 秒来自外层
+   残差，约占 83%；Agent internal 多出的约 6.974 秒只占剩余部分。远端冷拉取组也
+   得到相同方向，说明这不是 Registry pull 造成的。
+3. 图片 workload 中，VMM 的 Agent internal 从控制基线的约 9.244 秒增至约 14.442 秒，
+   反映了模型决定调用工具、接收工具结果和写回 session 的额外 Agent 工作；但工具
+   本身只有约 91 ms。因此这几秒不能解释 VMM 的约 40 秒外层残差，图片算法不是主瓶颈。
+
+所以 Agent 指标与 Gateway/health 的结论是一致的：VMM 的主要额外时间发生在 embedded Agent 之外，尤其是新 CLI 的 Guest bootstrap 和文件访问；`agent_internal` 只回答模型/Agent 工作本身花了多久。当前数据还没有把外层残差进一步拆成 CLI 启动、session/auth、结果序列化和退出各自的精确值，因此报告不把这几个子项假装成独立测量结果。
+
 ## 9. 诊断实验：Gateway、Guest 文件与 syscall
 
 主结果回答“哪里慢”，诊断实验用于回答“为什么慢”。诊断实验样本较少，且 syscall trace 会放大 virtiofs 往返，因此只用于定位候选瓶颈，不替代三轮主结果。
@@ -318,6 +361,66 @@ artifact：`.artifacts/stage-profile-20260717T063949Z`，每种 handler 一轮�
 | CLI outer portion | 3,348 ms | 3,345 ms | 32,641 ms |
 
 health 的主要差异位于新建 health CLI 的 guest 生命周期；CRI/vsock residual 和真正的 Gateway health handler 只占很小部分。
+
+### 9.1.1 先区分两个指标的计时边界
+
+这两个指标不是同一个操作，也不是前后相加的两个阶段：
+
+```text
+Gateway ready（一次性的长生命周期 Gateway）
+StartContainer 返回
+  → 启动 OpenClaw Gateway 进程
+  → Node/模块/插件 bootstrap
+  → 配置、认证、Gateway、HTTP、channels 初始化
+  → 日志出现 [gateway] ready
+
+health exec wall（Gateway 已经运行后，重新启动一次 CLI）
+crictl exec 发出
+  → 新建 node openclaw.mjs gateway health 进程
+  → CLI/模块/插件/state bootstrap
+  → 连接已经运行的 Gateway 并执行 health handler
+  → 返回 JSON、序列化并退出
+```
+
+因此，`Gateway ready` 包含“第一次启动 Gateway 本身”，而 `health exec wall` 不会再次启动 Gateway；它主要重复的是一次新的 OpenClaw CLI 启动。`health internal` 只覆盖 health JSON 内部记录的 handler 时间，不能代表完整的 CLI 调用耗时。
+
+### 9.1.2 Gateway ready 的差值是怎样产生的
+
+下面把同一诊断批次中 VMM 相对普通 runc 的差值重新合并。这里的“配置日志前”就是从 OpenClaw exec marker 到第一条 `[gateway] loading configuration` 日志的时间；它不是 Gateway handler 已经运行了这么久，而是 CLI/Node 在打印第一条 Gateway 日志前的 bootstrap。
+
+| Gateway 时间段 | runc | kuasar-vmm | VMM 比 runc 多 | 占观察到的 ready 差值 |
+| --- | ---: | ---: | ---: | ---: |
+| 状态 readiness + OpenClaw exec | 3 ms | 39 ms | +36 ms | 约 0.1% |
+| 第一条 configuration 日志之前（CLI/Node bootstrap） | 3,190 ms | 33,483 ms | **+30,293 ms** | **约 77.6%** |
+| configuration → actual ready（配置、认证、Gateway、HTTP、channels） | 444 ms | 9,163 ms | **+8,719 ms** | **约 22.3%** |
+| 日志观察残差 | 486 ms | 444 ms | −42 ms | 约 −0.1% |
+| **从 start 观察到 `[gateway] ready`** | **4,123 ms** | **43,129 ms** | **+39,006 ms** | **100%** |
+
+这个表说明：VMM 的约 39 秒额外时间中，约 30 秒发生在 Gateway 首条日志之前，约 8.7 秒发生在 Gateway 已开始打印日志之后；日志轮询本身只有每次约 21--24 ms，不能解释这 39 秒。换句话说，不能把全部差值称为“Gateway HTTP ready 慢”，其中最大的一段其实是 OpenClaw CLI/Node 尚未进入 Gateway 日志阶段时的文件和模块 bootstrap。
+
+### 9.1.3 health exec wall 的差值是怎样产生的
+
+`health exec wall` 可以按脚本的计时边界写成：
+
+```text
+host wall = guest command wall + CRI/transport residual
+guest command wall = CLI outer portion + health JSON durationMs
+```
+
+同一诊断批次的数值如下：
+
+| health 时间段 | runc | kuasar-vmm | VMM 比 runc 多 | 对 guest wall 差值的贡献 |
+| --- | ---: | ---: | ---: | ---: |
+| CRI/host transport residual | 55 ms | 64 ms | +9 ms | 可忽略 |
+| CLI outer portion（新 CLI bootstrap、退出等） | 3,348 ms | 32,641 ms | **+29,293 ms** | **约 98.0%** |
+| health JSON `durationMs`（真正 handler） | 8 ms | 609 ms | +601 ms | 约 2.0% |
+| **health exec wall** | **3,411 ms** | **33,314 ms** | **+29,903 ms** | **100%** |
+
+这里的 `CLI outer portion` 是 guest command wall 减去 JSON `durationMs` 的派生值，包含新 CLI 的进程启动、Node 模块/插件/state 检查以及退出前后的处理；它不是网络传输时间。日志中的 `WS handler observation`（runc 0 ms、VMM 115 ms）是 Gateway 侧的独立观测点，用来证明 WebSocket health handler 很短，不应再与 `CLI outer portion` 机械相加。
+
+所以 VMM 的 health 慢并不是因为 Gateway 返回 health JSON 慢了 30 秒：真正的 handler 只有约 0.6 秒，约 29.3 秒花在新 CLI 的 guest bootstrap。这个数值与 Gateway ready 阶段“首条 configuration 日志之前多约 30.3 秒”高度接近，说明两者共享同一个候选瓶颈：在 Guest/virtiofs 上重新扫描 `/app` 模块、插件和状态文件时，大量 metadata 小文件访问的单次往返成本较高。
+
+因此，对两组指标应这样理解：`Gateway ready` 衡量一次完整 Gateway 冷启动；`health exec wall` 衡量 Gateway 已启动后的“一次新 CLI 冷启动 + 很短的 health 请求”。二者差值相近不是重复计时，而是两个不同调用都重复触发了昂贵的 OpenClaw CLI bootstrap。
 
 ### 9.2 Guest 挂载、文件微基准与 CLI 黑盒
 
