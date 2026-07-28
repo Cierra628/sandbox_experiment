@@ -1,0 +1,36 @@
+diff --git a/vmm/sandbox/src/cloud_hypervisor/client.rs b/vmm/sandbox/src/cloud_hypervisor/client.rs
+--- a/vmm/sandbox/src/cloud_hypervisor/client.rs
++++ b/vmm/sandbox/src/cloud_hypervisor/client.rs
+@@ -81,6 +81,7 @@ impl ChClient {
+                     vhost_user: false,
+                     vhost_socket: None,
+                     id: blk.id,
++                    image_type: "Raw".to_string(),
+                 };
+                 let request_body = serde_json::to_string(&disk_config)
+                     .map_err(|e| anyhow!("failed to marshal {:?} to json, {}", disk_config, e))?;
+diff --git a/vmm/sandbox/src/cloud_hypervisor/devices/block.rs b/vmm/sandbox/src/cloud_hypervisor/devices/block.rs
+--- a/vmm/sandbox/src/cloud_hypervisor/devices/block.rs
++++ b/vmm/sandbox/src/cloud_hypervisor/devices/block.rs
+@@ -24,6 +24,7 @@ pub struct Disk {
+     path: String,
+     id: String,
+     readonly: Option<bool>,
++    image_type: Option<String>,
+     direct: Option<bool>,
+     iommu: Option<bool>,
+     num_queues: Option<u32>,
+@@ -42,6 +43,7 @@ impl Disk {
+             path: path.to_string(),
+             id: id.to_string(),
+             readonly: Some(readonly),
++            image_type: Some("raw".to_string()),
+             direct: Some(direct),
+             iommu: None,
+             num_queues: None,
+@@ -60,4 +62,5 @@ pub struct DiskConfig {
+     pub vhost_user: bool,
+     pub vhost_socket: Option<String>,
+     pub id: String,
++    pub image_type: String,
+ }

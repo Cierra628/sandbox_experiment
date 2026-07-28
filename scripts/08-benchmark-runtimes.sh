@@ -8,12 +8,14 @@ RUNS="${BENCHMARK_RUNS:-3}"
 MODEL_SAMPLE_RUNS="${MODEL_SAMPLE_RUNS:-0}"
 MODEL_SAMPLE_MESSAGE="${MODEL_SAMPLE_MESSAGE:-Reply with exactly KUASAR_SAMPLE_OK and nothing else.}"
 MODEL_SAMPLE_EXPECTED="${MODEL_SAMPLE_EXPECTED:-KUASAR_SAMPLE_OK}"
+MODEL_SAMPLE_ARTIFACT_PATH="${MODEL_SAMPLE_ARTIFACT_PATH:-}"
+MODEL_SAMPLE_ARTIFACT_TIMEOUT="${MODEL_SAMPLE_ARTIFACT_TIMEOUT:-10}"
 READY_TIMEOUT="${READY_TIMEOUT:-180}"
 OPENCLAW_DATA_DIR="${OPENCLAW_DATA_DIR:-$HOME/.local/share/openclaw-kuasar/openclaw-state}"
 RESULT_DIR="${RESULT_DIR:-$ROOT_DIR/.artifacts/breakdown-$(date -u +%Y%m%dT%H%M%SZ)}"
 CRI=(sudo crictl --runtime-endpoint "$CRI_ENDPOINT" --image-endpoint "$CRI_ENDPOINT")
-for v in "$RUNS" "$MODEL_SAMPLE_RUNS" "$READY_TIMEOUT"; do [[ "$v" =~ ^[0-9]+$ ]] || { echo "error: counts/timeouts must be integers" >&2; exit 2; }; done
-[ "$RUNS" -ge 1 ] && [ "$READY_TIMEOUT" -ge 1 ] || exit 2
+for v in "$RUNS" "$MODEL_SAMPLE_RUNS" "$MODEL_SAMPLE_ARTIFACT_TIMEOUT" "$READY_TIMEOUT"; do [[ "$v" =~ ^[0-9]+$ ]] || { echo "error: counts/timeouts must be integers" >&2; exit 2; }; done
+[ "$RUNS" -ge 1 ] && [ "$MODEL_SAMPLE_ARTIFACT_TIMEOUT" -ge 1 ] && [ "$READY_TIMEOUT" -ge 1 ] || exit 2
 command -v jq >/dev/null; command -v crictl >/dev/null; sudo -v
 mkdir -p "$RESULT_DIR/specs"
 TSV="$RESULT_DIR/results.tsv"
@@ -25,7 +27,7 @@ wait_gateway_log(){ local cid="$1" deadline=$((SECONDS+READY_TIMEOUT)) logs; whi
 write_row(){ local h="$1" r="$2" s="$3" n="$4"; n="${n//$'\t'/ }"; n="${n//$'\n'/ }"; printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$h" "$r" "$s" "$cri_ready_ms" "$runp_ms" "$create_ms" "$start_ms" "$gateway_ready_ms" "$exec_true_ms" "$exec_node_ms" "$health_exec_ms" "$health_internal_ms" "$sample_exec_ms" "$sample_internal_ms" "$cleanup_ms" "$total_ms" "$n" >> "$TSV"; }
 run_once(){
  local handler="$1" run="$2" bp="$ROOT_DIR/containerd/openclaw-pod.json" bc="$ROOT_DIR/containerd/openclaw-container.json"
- local pod_spec container_spec uid pod='' cid='' output='' status=PASS note='' begin end ready_begin cleanup_begin
+ local pod_spec container_spec uid pod='' cid='' output='' status=PASS note='' begin end ready_begin cleanup_begin sample_artifact_file sample_artifact_tmp sample_artifact_stderr artifact_deadline artifact_captured
  local cri_ready_ms=0 runp_ms=0 create_ms=0 start_ms=0 gateway_ready_ms=0 exec_true_ms=0 exec_node_ms=0 health_exec_ms=0 health_internal_ms=0 sample_exec_ms=0 sample_internal_ms=0 cleanup_ms=0 total_ms=0
  [ "$handler" = kuasar-vmm ] && { bp="$ROOT_DIR/containerd/openclaw-pod-vmm.json"; bc="$ROOT_DIR/containerd/openclaw-container-vmm.json"; }
  uid="breakdown-${handler}-${run}-$(date +%s%N)"; pod_spec="$RESULT_DIR/specs/${handler}-${run}-pod.json"; container_spec="$RESULT_DIR/specs/${handler}-${run}-container.json"
@@ -51,6 +53,33 @@ run_once(){
   if timed_capture output sample_exec_ms "${CRI[@]}" exec "$cid" node openclaw.mjs agent --local --agent main --session-key "agent:main:breakdown-${handler}-${run}-$(date +%s)" --message "$MODEL_SAMPLE_MESSAGE" --timeout 180 --json; then
    printf '%s\n' "$output" > "$RESULT_DIR/${handler}-run${run}-sample.json"; sample_internal_ms="$(jq -r '.meta.durationMs//0' <<<"$output")"; [ "$(jq -r '.payloads[0].text//""' <<<"$output")" = "$MODEL_SAMPLE_EXPECTED" ] || { status=FAIL; note=sample-output-mismatch; }
   else status=FAIL; note=sample-exec-failed; fi
+ fi
+ if [ "$status" = PASS ] && [ "$run" -le "$MODEL_SAMPLE_RUNS" ] && [ -n "$MODEL_SAMPLE_ARTIFACT_PATH" ]; then
+  sample_artifact_file="$RESULT_DIR/${handler}-run${run}-sample-artifact.json"
+  sample_artifact_tmp="${sample_artifact_file}.tmp"
+  sample_artifact_stderr="$RESULT_DIR/${handler}-run${run}-sample-artifact.stderr"
+  artifact_deadline="$(( $(now_ms) + MODEL_SAMPLE_ARTIFACT_TIMEOUT * 1000 ))"
+  artifact_captured=0
+  : > "$sample_artifact_stderr"
+  rm -f "$sample_artifact_file" "$sample_artifact_tmp"
+  while [ "$(now_ms)" -lt "$artifact_deadline" ]; do
+   if "${CRI[@]}" exec "$cid" sh -c 'test -s "$1" && cat "$1"' _ "$MODEL_SAMPLE_ARTIFACT_PATH" \
+      > "$sample_artifact_tmp" \
+      2>> "$sample_artifact_stderr" \
+      && [ -s "$sample_artifact_tmp" ] \
+      && jq -e . "$sample_artifact_tmp" >/dev/null 2>&1; then
+    mv "$sample_artifact_tmp" "$sample_artifact_file"
+    artifact_captured=1
+    break
+   fi
+   rm -f "$sample_artifact_tmp"
+   sleep 0.2
+  done
+  rm -f "$sample_artifact_tmp"
+  if [ "$artifact_captured" -ne 1 ]; then
+   status=FAIL
+   note=sample-artifact-capture-timeout
+  fi
  fi
  [ -z "$cid" ] || "${CRI[@]}" logs "$cid" > "$RESULT_DIR/${handler}-run${run}.log" 2>&1 || true
  cleanup_begin="$(now_ms)"; cleanup_ids "$cid" "$pod"; end="$(now_ms)"; cleanup_ms="$((end-cleanup_begin))"; cid=''; pod=''

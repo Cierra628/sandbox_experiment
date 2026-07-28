@@ -1,0 +1,45 @@
+[sandbox]
+log_level = "info"
+enable_tracing = false
+
+[sandbox.snapshot]
+enable_environment_restore = false
+enable_warmfork_restore = false
+enable_continuation_restore = false
+max_concurrent_restores = 1
+fallback_to_fresh_boot = true
+default_memory_restore_mode = "copy"
+
+[hypervisor]
+path = "/usr/local/libexec/openclaw-kuasar/cloud-hypervisor"
+vcpus = 2
+memory_in_mb = 2048
+kernel_path = "/var/lib/openclaw-kuasar/kuasar/vmlinux.bin"
+image_path = "/var/lib/openclaw-kuasar/kuasar/kuasar.img"
+initrd_path = ""
+kernel_params = ""
+hugepages = false
+entropy_source = "/dev/urandom"
+debug = false
+container_storage_backend = "virtio-blk"
+
+[hypervisor.virtio_blk]
+allow_large_bind_mount = true
+enable_reflink_cow = false
+block_image_size_overhead_percent = 20
+small_dir_max_files = 50
+small_dir_max_bytes = 10485760
+overlay_image_fallback_size_mb = 128
+bind_image_fallback_size_mb = 64
+direct_io = false
+
+[hypervisor.task]
+debug = false
+enable_tracing = false
+
+[hypervisor.virtiofsd]
+path = "/usr/libexec/virtiofsd"
+log_level = "info"
+cache = "never"
+thread_pool_size = 4
+syslog = true

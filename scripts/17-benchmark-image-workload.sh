@@ -40,15 +40,20 @@ for h in $HANDLERS; do
     state="$STATE_DIR"; [ "$h" = kuasar-vmm ] && state="$VMM_STATE_DIR"
     if [ "$h" = kuasar-vmm ]; then sudo rm -f "$state/workspace/complex-workload/output.pgm" "$state/workspace/complex-workload/output.pgm.json"; else rm -f "$state/workspace/complex-workload/output.pgm" "$state/workspace/complex-workload/output.pgm.json"; fi
     set +e
-    BENCHMARK_HANDLERS="$h" BENCHMARK_RUNS=1 MODEL_SAMPLE_RUNS=1 MODEL_SAMPLE_MESSAGE="$PROMPT" MODEL_SAMPLE_EXPECTED=KUASAR_SAMPLE_OK OPENCLAW_IMAGE="$OPENCLAW_IMAGE" OPENCLAW_DATA_DIR="$STATE_DIR" VMM_OPENCLAW_DATA_DIR="$VMM_STATE_DIR" RESULT_DIR="$dir" "$ROOT_DIR/scripts/08-benchmark-runtimes.sh" > "$dir/runner.log" 2>&1
+    BENCHMARK_HANDLERS="$h" BENCHMARK_RUNS=1 MODEL_SAMPLE_RUNS=1 MODEL_SAMPLE_MESSAGE="$PROMPT" MODEL_SAMPLE_EXPECTED=KUASAR_SAMPLE_OK MODEL_SAMPLE_ARTIFACT_PATH=/home/node/.openclaw/workspace/complex-workload/output.pgm.json OPENCLAW_IMAGE="$OPENCLAW_IMAGE" OPENCLAW_DATA_DIR="$STATE_DIR" VMM_OPENCLAW_DATA_DIR="$VMM_STATE_DIR" RESULT_DIR="$dir" "$ROOT_DIR/scripts/08-benchmark-runtimes.sh" > "$dir/runner.log" 2>&1
     rc=$?
     set -e
     base="$(jq '.[0] // {}' "$dir/results.json" 2>/dev/null || printf '{}')"
-    if [ "$h" = kuasar-vmm ]; then trace="$(sudo cat "$state/workspace/complex-workload/output.pgm.json" 2>/dev/null || true)"; else trace="$(cat "$state/workspace/complex-workload/output.pgm.json" 2>/dev/null || true)"; fi
+    artifact="$dir/${h}-run1-sample-artifact.json"
+    trace="$(cat "$artifact" 2>/dev/null || true)"
     [ -n "$trace" ] || trace='{}'
-    status="$(jq -r '.status // "FAIL"' <<<"$base")"; [ "$rc" -eq 0 ] || status=FAIL
-    jq -e '.ok == true and .input.pixels == 1024 and .output.pixels == 4096 and .scale == 2' >/dev/null 2>&1 <<<"$trace" || status=FAIL
-    jq -n --arg handler "$h" --argjson run "$r" --arg status "$status" --argjson base "$base" --argjson trace "$trace" '$base + {handler:$handler,run:$run,status:$status,validation:{tool_trace:($trace.ok == true and $trace.input.pixels == 1024 and $trace.output.pixels == 4096 and $trace.scale == 2)},tool:{read_ms:($trace.timing_ms.read//0),compute_ms:($trace.timing_ms.compute//0),write_ms:($trace.timing_ms.write//0),total_ms:($trace.timing_ms.total//0)},image:{input_bytes:($trace.input.bytes//0),output_bytes:($trace.output.bytes//0),input_pixels:($trace.input.pixels//0),output_pixels:($trace.output.pixels//0)}}' > "$RESULT_DIR/rows/$h-$r.json"
+    status="$(jq -r '.status // "FAIL"' <<<"$base")"; note="$(jq -r '.note // ""' <<<"$base")"; [ "$rc" -eq 0 ] || status=FAIL
+    if ! jq -e '.ok == true and .input.pixels == 1024 and .output.pixels == 4096 and .scale == 2' >/dev/null 2>&1 <<<"$trace"; then
+      status=FAIL
+      [ -z "$note" ] || note="$note;"
+      note="${note}sample-artifact-invalid"
+    fi
+    jq -n --arg handler "$h" --argjson run "$r" --arg status "$status" --arg note "$note" --argjson base "$base" --argjson trace "$trace" '$base + {handler:$handler,run:$run,status:$status,note:$note,validation:{tool_trace:($trace.ok == true and $trace.input.pixels == 1024 and $trace.output.pixels == 4096 and $trace.scale == 2)},tool:{read_ms:($trace.timing_ms.read//0),compute_ms:($trace.timing_ms.compute//0),write_ms:($trace.timing_ms.write//0),total_ms:($trace.timing_ms.total//0)},image:{input_bytes:($trace.input.bytes//0),output_bytes:($trace.output.bytes//0),input_pixels:($trace.input.pixels//0),output_pixels:($trace.output.pixels//0)}}' > "$RESULT_DIR/rows/$h-$r.json"
     printf 'handler=%s run=%s status=%s\n' "$h" "$r" "$status"
   done
 done
