@@ -5,3 +5,4 @@
 images/openclaw/*.tar
 
 HANDOFF.md
+docs/2026-08-03-overlay-union-implementation-plan.md
