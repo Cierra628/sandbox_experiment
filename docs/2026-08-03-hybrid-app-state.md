@@ -10,19 +10,17 @@
 - `.artifacts/overlayfs-union-smoke-20260803T090831Z`
 - `.artifacts/union-reuse-20260803T093038Z`
 
-OpenClaw 的主要瓶颈不是本地超分计算，而是 VMM 内启动 Node/OpenClaw 时对大量小文件执行 metadata、插件和配置初始化。VirtioFS `cache=never` 最慢；virtio-blk 最快但把约 5.9 s 的设备/rootfs 准备成本放进 `start`。混合挂载方案已经功能验证通过，在保留 VirtioFS 只读 lower 和镜像共享语义的同时，把 `/app` 的可写 upper/work 与状态目录放到 virtio-blk，是当前较平衡的方案。
-
 ### 关键结果（3 轮新建实例，单位 s）
 
-| 配置 | `start` | Gateway ready | Agent sample | 单轮 total |
-| --- | ---: | ---: | ---: | ---: |
-| VirtioFS `cache=never` | 0.068 | 38.680 | 54.336 | 126.039 |
-| VirtioFS `cache=metadata` | 0.052 | 7.694 | 11.159 | 27.339 |
-| 全 virtio-blk | 5.930 | 5.604 | 9.496 | 26.851 |
-| 直接混合：virtio-blk `/app` + state | 0.067 | 7.380 | 9.825 | 25.454 |
-| **union：VirtioFS lower + virtio-blk upper/work + state** | **0.070** | **7.724** | **11.357** | **26.778** |
+| 配置 | `start` | Gateway ready | health exec wall | Agent sample | 单轮 total |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| VirtioFS `cache=never` | 0.068 | 38.680 | 31.802 | 54.336 | 126.039 |
+| VirtioFS `cache=metadata` | 0.052 | 7.694 | 7.352 | 11.159 | 27.339 |
+| 全 virtio-blk | 5.930 | 5.604 | 4.541 | 9.496 | 26.851 |
+| 直接混合：virtio-blk `/app` + state | 0.067 | 7.380 | 6.973 | 9.825 | 25.454 |
+| **union：VirtioFS lower + virtio-blk upper/work + state** | **0.070** | **7.724** | **6.438** | **11.357** | **26.778** |
 
-表中每一行都是镜像已缓存后的 3 轮新建实例 workload；远端 pull 不在这些时间内。`total` 均来自相应 image-workload 脚本，适合做同一类新建实例的整体比较；若只比较阶段差异，应优先看 `start`、`Gateway ready` 和 `Agent sample`。
+表中每一行都是镜像已缓存后的 3 轮新建实例 workload；远端 pull 不在这些时间内。加入 `health exec wall` 后，表中的主要应用阶段已经覆盖从容器启动到 Agent sample 的大部分外层耗时；`runp`、`create`、CRI 就绪、cleanup 以及日志/结果收集仍未在此简表中单列，因此这些列相加不会严格等于 `total`。`total` 均来自相应 image-workload 脚本，适合做同一类新建实例的整体比较；若只比较阶段差异，应优先看 `start`、`Gateway ready`、`health exec wall` 和 `Agent sample`。
 
 所有上述 workload 均为 3/3 PASS；Agent 实际完成 32×32→64×64 的本地 `image_upscale`，工具本身约 0.09--0.12 s，因此不是主要瓶颈。
 
