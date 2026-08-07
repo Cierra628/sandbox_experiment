@@ -6,3 +6,5 @@ images/openclaw/*.tar
 
 HANDOFF.md
 docs/2026-08-03-overlay-union-implementation-plan.md
+docs/superpowers/plans/2026-08-07-hybrid-metadata-optimization.md
+docs/superpowers/plans/2026-08-07-hot-app-path-attribution.md
