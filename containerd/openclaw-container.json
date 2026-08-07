@@ -3,7 +3,7 @@
     "name": "openclaw-gateway"
   },
   "image": {
-    "image": "10.2.30.50:5000/openclaw-kuasar:2026.6.11-virtiofs"
+    "image": "localhost/openclaw-kuasar:2026.6.11-virtiofs"
   },
   "command": ["node"],
   "args": ["openclaw.mjs", "gateway", "--bind", "loopback", "--port", "18790"],
@@ -19,7 +19,7 @@
   "mounts": [
     {
       "container_path": "/home/node/.openclaw",
-      "host_path": "/home/yyxie/.local/share/openclaw-kuasar/openclaw-state",
+      "host_path": "/tmp/tmp.npD0JKWyCr",
       "readonly": false
     }
   ],

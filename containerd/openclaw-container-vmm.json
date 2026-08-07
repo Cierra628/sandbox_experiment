@@ -3,7 +3,7 @@
     "name": "openclaw-gateway"
   },
   "image": {
-    "image": "10.2.30.50:5000/openclaw-kuasar:2026.6.11-virtiofs"
+    "image": "localhost/openclaw-kuasar:2026.6.11-virtiofs"
   },
   "command": [
     "sh"

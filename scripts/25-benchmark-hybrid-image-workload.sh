@@ -7,11 +7,15 @@ BASE_POD_SPEC="$ROOT_DIR/containerd/openclaw-pod-vmm.json"
 BASE_CONTAINER_SPEC="$ROOT_DIR/containerd/openclaw-container-vmm.json"
 STATE_LOOP_DEVICE="${HYBRID_STATE_LOOP_DEVICE:-}"
 APP_LOOP_DEVICE="${HYBRID_APP_LOOP_DEVICE:-}"
+APP_MODE="${HYBRID_APP_MODE:-virtio-blk}"
+RUNTIME_LOOP_DEVICE="${HYBRID_RUNTIME_LOOP_DEVICE:-}"
 RUNS="${HYBRID_IMAGE_RUNS:-3}"
 PASSES="${HYBRID_IMAGE_PASSES:-512}"
 READY_TIMEOUT="${HYBRID_IMAGE_READY_TIMEOUT:-180}"
 ARTIFACT_TIMEOUT="${HYBRID_IMAGE_ARTIFACT_TIMEOUT:-15}"
+LOG_CAPTURE_TIMEOUT="${HYBRID_IMAGE_LOG_TIMEOUT:-10}"
 RESULT_DIR="${HYBRID_IMAGE_RESULT_DIR:-$ROOT_DIR/.artifacts/hybrid-image-workload-$(date -u +%Y%m%dT%H%M%SZ)}"
+IMAGE="${HYBRID_IMAGE:-localhost/openclaw-kuasar:2026.6.11-virtiofs}"
 
 usage() {
   printf '%s\n' \
@@ -21,7 +25,10 @@ usage() {
     '' \
     'Options:' \
     '  --state-loop DEV       existing state loop block device' \
-    '  --app-loop DEV         existing /app loop block device' \
+    '  --app-loop DEV         existing /app loop block device (virtio-blk mode)' \
+    '  --app-mode MODE        /app backing: virtio-blk or virtiofs (default: virtio-blk)' \
+    '  --runtime-loop DEV     optional /usr/local loop block device' \
+    '  --image IMAGE          workload image (default: registry mirror image)' \
     '  --runs N               independent fresh containers (default: 3)' \
     '  --passes N             image-upscale compute passes (default: 512)' \
     '  --ready-timeout N      Gateway ready timeout in seconds' \
@@ -34,6 +41,9 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --state-loop) STATE_LOOP_DEVICE="$2"; shift 2 ;;
     --app-loop) APP_LOOP_DEVICE="$2"; shift 2 ;;
+    --app-mode) APP_MODE="$2"; shift 2 ;;
+    --runtime-loop) RUNTIME_LOOP_DEVICE="$2"; shift 2 ;;
+    --image) IMAGE="$2"; shift 2 ;;
     --runs) RUNS="$2"; shift 2 ;;
     --passes) PASSES="$2"; shift 2 ;;
     --ready-timeout) READY_TIMEOUT="$2"; shift 2 ;;
@@ -44,7 +54,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-for value_name in RUNS PASSES READY_TIMEOUT ARTIFACT_TIMEOUT; do
+for value_name in RUNS PASSES READY_TIMEOUT ARTIFACT_TIMEOUT LOG_CAPTURE_TIMEOUT; do
   value="${!value_name}"
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
     echo "error: $value_name must be positive" >&2
@@ -52,16 +62,31 @@ for value_name in RUNS PASSES READY_TIMEOUT ARTIFACT_TIMEOUT; do
   }
 done
 [ -n "$STATE_LOOP_DEVICE" ] || { echo 'error: state loop device is required' >&2; exit 2; }
-[ -n "$APP_LOOP_DEVICE" ] || { echo 'error: app loop device is required' >&2; exit 2; }
+case "$APP_MODE" in
+  virtiofs|virtio-blk) ;;
+  *) echo 'error: --app-mode must be virtiofs or virtio-blk' >&2; exit 2 ;;
+esac
+if [ "$APP_MODE" = virtio-blk ]; then
+  [ -n "$APP_LOOP_DEVICE" ] || { echo 'error: app loop device is required for virtio-blk app mode' >&2; exit 2; }
+fi
+
+if [ "$APP_MODE" = virtio-blk ]; then
+  CONFIG_LABEL="virtiofs-root+virtio-blk-app+virtio-blk-state"
+else
+  CONFIG_LABEL="virtiofs-root+virtiofs-app+virtio-blk-state"
+fi
+[ -z "$RUNTIME_LOOP_DEVICE" ] || CONFIG_LABEL="${CONFIG_LABEL}+virtio-blk-usr-local"
 
 printf '%s\n' \
   'Hybrid image workload benchmark plan:' \
   '  rootfs=VirtioFS' \
-  '  /app on virtio-blk (read-only)' \
+  "  /app on $APP_MODE (read-only)" \
   '  /home/node/.openclaw on virtio-blk (read-write)' \
   '  handler=kuasar-vmm' \
-  "  app_loop=$APP_LOOP_DEVICE" \
+  "  app_mode=$APP_MODE" \
+  "  app_loop=${APP_LOOP_DEVICE:-none}" \
   "  state_loop=$STATE_LOOP_DEVICE" \
+  "  runtime_loop=${RUNTIME_LOOP_DEVICE:-none}" \
   "  runs=$RUNS" \
   "  passes=$PASSES" \
   '  input=32x32 PGM (1024 pixels)' \
@@ -70,9 +95,16 @@ printf '%s\n' \
 
 command -v jq >/dev/null 2>&1 || { echo 'error: jq is required' >&2; exit 1; }
 command -v crictl >/dev/null 2>&1 || { echo 'error: crictl is required' >&2; exit 1; }
+command -v timeout >/dev/null 2>&1 || { echo 'error: timeout is required' >&2; exit 1; }
 sudo -v
 sudo test -b "$STATE_LOOP_DEVICE" || { echo "error: not a block device: $STATE_LOOP_DEVICE" >&2; exit 1; }
-sudo test -b "$APP_LOOP_DEVICE" || { echo "error: not a block device: $APP_LOOP_DEVICE" >&2; exit 1; }
+if [ "$APP_MODE" = virtio-blk ]; then
+  sudo test -b "$APP_LOOP_DEVICE" || { echo "error: not a block device: $APP_LOOP_DEVICE" >&2; exit 1; }
+fi
+[ -z "$RUNTIME_LOOP_DEVICE" ] || sudo test -b "$RUNTIME_LOOP_DEVICE" || {
+  echo "error: not a block device: $RUNTIME_LOOP_DEVICE" >&2
+  exit 1
+}
 sudo grep -Eq '^[[:space:]]*container_storage_backend[[:space:]]*=[[:space:]]*"virtiofs"' \
   /etc/openclaw-kuasar/vmm.toml || {
     echo 'error: /etc/openclaw-kuasar/vmm.toml is not configured for virtiofs' >&2
@@ -89,9 +121,18 @@ fi
 
 mkdir -p "$RESULT_DIR/specs" "$RESULT_DIR/rows"
 HYBRID_CONTAINER_SPEC="$RESULT_DIR/specs/container-template.json"
-jq --arg state "$STATE_LOOP_DEVICE" --arg app "$APP_LOOP_DEVICE" '
+jq --arg state "$STATE_LOOP_DEVICE" --arg app "$APP_LOOP_DEVICE" --arg app_mode "$APP_MODE" --arg runtime "$RUNTIME_LOOP_DEVICE" --arg image "$IMAGE" '
   (.mounts[] | select(.container_path == "/home/node/.openclaw")).host_path = $state |
-  .mounts += [{"container_path":"/app","host_path":$app,"readonly":true}] |
+  .mounts |= map(select(.container_path != "/app" and .container_path != "/usr/local")) |
+  .mounts += (
+    (if $app_mode == "virtio-blk" then
+       [{"container_path":"/app","host_path":$app,"readonly":true}]
+     else [] end)
+    + (if $runtime != "" then
+         [{"container_path":"/usr/local","host_path":$runtime,"readonly":true}]
+       else [] end)
+  ) |
+  .image.image = $image |
   .metadata.name = "openclaw-hybrid-image-workload" |
   .linux.security_context.run_as_user.value = 0 |
   .linux.security_context.run_as_group.value = 0
@@ -111,26 +152,19 @@ cleanup_ids() {
 }
 
 wait_gateway_log() {
-  local cid="$1" deadline=$((SECONDS + READY_TIMEOUT)) logs
-  while [ "$SECONDS" -lt "$deadline" ]; do
-    logs="$("${CRI[@]}" logs "$cid" 2>&1 || true)"
-    if grep -q '\[gateway\] ready' <<<"$logs"; then
-      return 0
-    fi
-    if "${CRI[@]}" inspect "$cid" 2>/dev/null |
-      jq -e '.status.state == "CONTAINER_EXITED"' >/dev/null; then
-      printf '%s\n' "$logs" >&2
-      return 1
-    fi
-    sleep 1
-  done
-  return 1
+  local cid="$1" ready_rc
+  set +e
+  timeout "$READY_TIMEOUT" "${CRI[@]}" logs --follow "$cid" 2>&1 |
+    grep -m1 -q '\[gateway\] ready'
+  ready_rc="${PIPESTATUS[1]}"
+  set -e
+  [ "$ready_rc" -eq 0 ]
 }
 
 capture_mounts() {
   local cid="$1" output_file="$2"
   "${CRI[@]}" exec "$cid" sh -c \
-    'printf "%s\\n" "--- id ---"; id; printf "%s\\n" "--- fs types ---"; stat -f -c "%T %n" / /app /home/node/.openclaw; printf "%s\\n" "--- mountinfo ---"; grep -E " /app | /home/node/.openclaw " /proc/self/mountinfo || true' \
+    'printf "%s\\n" "--- id ---"; id; printf "%s\\n" "--- fs types ---"; stat -f -c "%T %n" / /app /usr/local /home/node/.openclaw; printf "%s\\n" "--- mountinfo ---"; grep -E " /app | /usr/local | /home/node/.openclaw " /proc/self/mountinfo || true' \
     > "$output_file" 2>&1 || true
 }
 
@@ -168,7 +202,7 @@ run_once() {
   local pod='' cid='' output='' status='PASS' note=''
   local pod_spec="$RESULT_DIR/specs/pod-$run.json"
   local container_spec="$RESULT_DIR/specs/container-$run.json"
-  local run_begin run_end ready_begin cleanup_begin health_begin sample_begin
+  local run_begin run_end ready_begin cleanup_begin log_capture_begin log_capture_ms=0 health_begin sample_begin
   local cri_ready_begin runp_begin create_begin start_begin
   local cri_ready_ms=0 runp_ms=0 create_ms=0 start_ms=0 gateway_ready_ms=0
   local health_exec_ms=0 health_internal_ms=0 sample_exec_ms=0 sample_internal_ms=0
@@ -294,21 +328,27 @@ run_once() {
     fi
   fi
 
-  [ -z "$cid" ] || "${CRI[@]}" logs "$cid" > "$RESULT_DIR/hybrid-image-run${run}.log" 2>&1 || true
+  log_capture_begin="$(now_ms)"
+  if [ -n "$cid" ]; then
+    timeout "$LOG_CAPTURE_TIMEOUT" "${CRI[@]}" logs "$cid" > "$RESULT_DIR/hybrid-image-run${run}.log" 2>&1 || true
+  fi
+  log_capture_ms="$(( $(now_ms) - log_capture_begin ))"
   cleanup_begin="$(now_ms)"
   cleanup_ids "$cid" "$pod"
   cleanup_ms="$(( $(now_ms) - cleanup_begin ))"
   run_end="$(now_ms)"
-  total_ms="$((run_end - run_begin))"
+  total_ms="$((run_end - run_begin - log_capture_ms))"
 
   jq -n \
     --arg handler kuasar-vmm \
-    --arg config virtiofs-root-virtio-blk-app-state \
+    --arg config "$CONFIG_LABEL" \
     --argjson run "$run" \
     --arg status "$status" \
     --arg note "$note" \
+    --arg app_mode "$APP_MODE" \
     --arg app_loop "$APP_LOOP_DEVICE" \
     --arg state_loop "$STATE_LOOP_DEVICE" \
+    --arg runtime_loop "$RUNTIME_LOOP_DEVICE" \
     --argjson cri_ready_ms "$cri_ready_ms" \
     --argjson runp_ms "$runp_ms" \
     --argjson create_ms "$create_ms" \
@@ -324,7 +364,7 @@ run_once() {
     --argjson tool_total_ms "$tool_total_ms" \
     --argjson cleanup_ms "$cleanup_ms" \
     --argjson total_ms "$total_ms" \
-    '{handler:$handler,config:$config,run:$run,status:$status,note:$note,app_loop:$app_loop,state_loop:$state_loop,cri_ready_ms:$cri_ready_ms,runp_ms:$runp_ms,create_ms:$create_ms,start_ms:$start_ms,gateway_ready_ms:$gateway_ready_ms,health_exec_ms:$health_exec_ms,health_internal_ms:$health_internal_ms,sample_exec_ms:$sample_exec_ms,sample_internal_ms:$sample_internal_ms,tool:{read_ms:$tool_read_ms,compute_ms:$tool_compute_ms,write_ms:$tool_write_ms,total_ms:$tool_total_ms},cleanup_ms:$cleanup_ms,total_ms:$total_ms}' \
+    '{handler:$handler,config:$config,run:$run,status:$status,note:$note,app_mode:$app_mode,app_loop:$app_loop,state_loop:$state_loop,runtime_loop:$runtime_loop,cri_ready_ms:$cri_ready_ms,runp_ms:$runp_ms,create_ms:$create_ms,start_ms:$start_ms,gateway_ready_ms:$gateway_ready_ms,health_exec_ms:$health_exec_ms,health_internal_ms:$health_internal_ms,sample_exec_ms:$sample_exec_ms,sample_internal_ms:$sample_internal_ms,tool:{read_ms:$tool_read_ms,compute_ms:$tool_compute_ms,write_ms:$tool_write_ms,total_ms:$tool_total_ms},cleanup_ms:$cleanup_ms,total_ms:$total_ms}' \
     > "$RESULT_DIR/rows/run-$run.json"
   printf 'run=%s status=%s gateway_ready_ms=%s health_exec_ms=%s sample_exec_ms=%s sample_internal_ms=%s total_ms=%s\n' \
     "$run" "$status" "$gateway_ready_ms" "$health_exec_ms" "$sample_exec_ms" "$sample_internal_ms" "$total_ms"
@@ -340,7 +380,7 @@ jq '
   def avg_tool($key): map(.tool[$key] // 0) | if length == 0 then 0 else add / length end;
   {
     handler: "kuasar-vmm",
-    config: "virtiofs-root+virtio-blk-app+virtio-blk-state",
+    config: $config,
     runs: length,
     passed: (map(select(.status == "PASS")) | length),
     failed: (map(select(.status != "PASS")) | length),
@@ -362,7 +402,7 @@ jq '
       total: avg("total_ms")
     }
   }
-' "$RESULT_DIR/results.json" > "$RESULT_DIR/summary.json"
+' --arg config "$CONFIG_LABEL" "$RESULT_DIR/results.json" > "$RESULT_DIR/summary.json"
 
 printf '%s\n' "results=$RESULT_DIR"
 jq . "$RESULT_DIR/summary.json"

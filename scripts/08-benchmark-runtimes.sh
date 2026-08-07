@@ -11,23 +11,32 @@ MODEL_SAMPLE_EXPECTED="${MODEL_SAMPLE_EXPECTED:-KUASAR_SAMPLE_OK}"
 MODEL_SAMPLE_ARTIFACT_PATH="${MODEL_SAMPLE_ARTIFACT_PATH:-}"
 MODEL_SAMPLE_ARTIFACT_TIMEOUT="${MODEL_SAMPLE_ARTIFACT_TIMEOUT:-10}"
 READY_TIMEOUT="${READY_TIMEOUT:-180}"
+LOG_CAPTURE_TIMEOUT="${LOG_CAPTURE_TIMEOUT:-10}"
 OPENCLAW_DATA_DIR="${OPENCLAW_DATA_DIR:-$HOME/.local/share/openclaw-kuasar/openclaw-state}"
 RESULT_DIR="${RESULT_DIR:-$ROOT_DIR/.artifacts/breakdown-$(date -u +%Y%m%dT%H%M%SZ)}"
 CRI=(sudo crictl --runtime-endpoint "$CRI_ENDPOINT" --image-endpoint "$CRI_ENDPOINT")
-for v in "$RUNS" "$MODEL_SAMPLE_RUNS" "$MODEL_SAMPLE_ARTIFACT_TIMEOUT" "$READY_TIMEOUT"; do [[ "$v" =~ ^[0-9]+$ ]] || { echo "error: counts/timeouts must be integers" >&2; exit 2; }; done
-[ "$RUNS" -ge 1 ] && [ "$MODEL_SAMPLE_ARTIFACT_TIMEOUT" -ge 1 ] && [ "$READY_TIMEOUT" -ge 1 ] || exit 2
-command -v jq >/dev/null; command -v crictl >/dev/null; sudo -v
+for v in "$RUNS" "$MODEL_SAMPLE_RUNS" "$MODEL_SAMPLE_ARTIFACT_TIMEOUT" "$READY_TIMEOUT" "$LOG_CAPTURE_TIMEOUT"; do [[ "$v" =~ ^[0-9]+$ ]] || { echo "error: counts/timeouts must be integers" >&2; exit 2; }; done
+[ "$RUNS" -ge 1 ] && [ "$MODEL_SAMPLE_ARTIFACT_TIMEOUT" -ge 1 ] && [ "$READY_TIMEOUT" -ge 1 ] && [ "$LOG_CAPTURE_TIMEOUT" -ge 1 ] || exit 2
+command -v jq >/dev/null; command -v crictl >/dev/null; command -v timeout >/dev/null; sudo -v
 mkdir -p "$RESULT_DIR/specs"
 TSV="$RESULT_DIR/results.tsv"
 printf '%s\n' $'handler\trun\tstatus\tcri_ready_ms\trunp_ms\tcreate_ms\tstart_ms\tgateway_ready_ms\texec_true_ms\texec_node_ms\thealth_exec_ms\thealth_internal_ms\tsample_exec_ms\tsample_internal_ms\tcleanup_ms\ttotal_ms\tnote' > "$TSV"
 now_ms(){ date +%s%3N; }
 timed_capture(){ local vv="$1" mv="$2" b e value; shift 2; b="$(now_ms)"; value="$("$@")"; e="$(now_ms)"; printf -v "$vv" %s "$value"; printf -v "$mv" %s "$((e-b))"; }
 cleanup_ids(){ local cid="$1" pod="$2"; set +e; [ -n "$cid" ] && "${CRI[@]}" stop "$cid" >/dev/null 2>&1; [ -n "$cid" ] && "${CRI[@]}" rm "$cid" >/dev/null 2>&1; [ -n "$pod" ] && "${CRI[@]}" stopp "$pod" >/dev/null 2>&1; [ -n "$pod" ] && "${CRI[@]}" rmp "$pod" >/dev/null 2>&1; set -e; }
-wait_gateway_log(){ local cid="$1" deadline=$((SECONDS+READY_TIMEOUT)) logs; while [ "$SECONDS" -lt "$deadline" ]; do logs="$("${CRI[@]}" logs "$cid" 2>&1 || true)"; grep -q '\[gateway\] ready' <<<"$logs" && return 0; "${CRI[@]}" inspect "$cid" 2>/dev/null | jq -e '.status.state=="CONTAINER_EXITED"' >/dev/null && { printf '%s\n' "$logs" >&2; return 1; }; sleep 1; done; return 1; }
+wait_gateway_log() {
+  local cid="$1" ready_rc
+  set +e
+  timeout "$READY_TIMEOUT" "${CRI[@]}" logs --follow "$cid" 2>&1 |
+    grep -m1 -q '\[gateway\] ready'
+  ready_rc="${PIPESTATUS[1]}"
+  set -e
+  [ "$ready_rc" -eq 0 ]
+}
 write_row(){ local h="$1" r="$2" s="$3" n="$4"; n="${n//$'\t'/ }"; n="${n//$'\n'/ }"; printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$h" "$r" "$s" "$cri_ready_ms" "$runp_ms" "$create_ms" "$start_ms" "$gateway_ready_ms" "$exec_true_ms" "$exec_node_ms" "$health_exec_ms" "$health_internal_ms" "$sample_exec_ms" "$sample_internal_ms" "$cleanup_ms" "$total_ms" "$n" >> "$TSV"; }
 run_once(){
  local handler="$1" run="$2" bp="$ROOT_DIR/containerd/openclaw-pod.json" bc="$ROOT_DIR/containerd/openclaw-container.json"
- local pod_spec container_spec uid pod='' cid='' output='' status=PASS note='' begin end ready_begin cleanup_begin sample_artifact_file sample_artifact_tmp sample_artifact_stderr artifact_deadline artifact_captured
+ local pod_spec container_spec uid pod='' cid='' output='' status=PASS note='' begin end ready_begin cleanup_begin log_capture_begin log_capture_ms=0 sample_artifact_file sample_artifact_tmp sample_artifact_stderr artifact_deadline artifact_captured
  local cri_ready_ms=0 runp_ms=0 create_ms=0 start_ms=0 gateway_ready_ms=0 exec_true_ms=0 exec_node_ms=0 health_exec_ms=0 health_internal_ms=0 sample_exec_ms=0 sample_internal_ms=0 cleanup_ms=0 total_ms=0
  [ "$handler" = kuasar-vmm ] && { bp="$ROOT_DIR/containerd/openclaw-pod-vmm.json"; bc="$ROOT_DIR/containerd/openclaw-container-vmm.json"; }
  uid="breakdown-${handler}-${run}-$(date +%s%N)"; pod_spec="$RESULT_DIR/specs/${handler}-${run}-pod.json"; container_spec="$RESULT_DIR/specs/${handler}-${run}-container.json"
@@ -81,9 +90,13 @@ run_once(){
    note=sample-artifact-capture-timeout
   fi
  fi
- [ -z "$cid" ] || "${CRI[@]}" logs "$cid" > "$RESULT_DIR/${handler}-run${run}.log" 2>&1 || true
+ log_capture_begin="$(now_ms)"
+ if [ -n "$cid" ]; then
+  timeout "$LOG_CAPTURE_TIMEOUT" "${CRI[@]}" logs "$cid" > "$RESULT_DIR/${handler}-run${run}.log" 2>&1 || true
+ fi
+ log_capture_ms="$(( $(now_ms) - log_capture_begin ))"
  cleanup_begin="$(now_ms)"; cleanup_ids "$cid" "$pod"; end="$(now_ms)"; cleanup_ms="$((end-cleanup_begin))"; cid=''; pod=''
- end="$(now_ms)"; total_ms="$((end-begin))"; write_row "$handler" "$run" "$status" "$note"; trap - RETURN
+ end="$(now_ms)"; total_ms="$((end-begin-log_capture_ms))"; write_row "$handler" "$run" "$status" "$note"; trap - RETURN
  printf '%s run=%s status=%s total_ms=%s\n' "$handler" "$run" "$status" "$total_ms"
 }
 OPENCLAW_DATA_DIR="$OPENCLAW_DATA_DIR" "$ROOT_DIR/scripts/03-generate-cri-specs.sh" >/dev/null

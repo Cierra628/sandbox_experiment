@@ -1,6 +1,7 @@
 # OpenClaw / Kuasar VMM 混合挂载实验
 
 实验日期：2026-08-03  
+最后更新：2026-08-07<br>
 平台：containerd CRI v1 + Kuasar VMM sandboxer + Cloud Hypervisor  
 实验结果目录：
 
@@ -21,6 +22,8 @@
 | **union：VirtioFS lower + virtio-blk upper/work + state** | **0.070** | **7.724** | **6.438** | **11.357** | **26.778** |
 
 表中每一行都是镜像已缓存后的 3 轮新建实例 workload；远端 pull 不在这些时间内。加入 `health exec wall` 后，表中的主要应用阶段已经覆盖从容器启动到 Agent sample 的大部分外层耗时；`runp`、`create`、CRI 就绪、cleanup 以及日志/结果收集仍未在此简表中单列，因此这些列相加不会严格等于 `total`。`total` 均来自相应 image-workload 脚本，适合做同一类新建实例的整体比较；若只比较阶段差异，应优先看 `start`、`Gateway ready`、`health exec wall` 和 `Agent sample`。
+
+这张表保留的是 08-03 的基线/union 时间线，用于说明方案演进；它不是 08-07 严格 `/app` A/B 的替代表。08-07 A/B 使用了同一远端镜像、`cache=metadata`、virtio-blk state 与 `/usr/local`，只切换 `/app` 的 backing，因而因果结论应以第 12 节为准，不能把两张表的数值直接相加或求平均。
 
 所有上述 workload 均为 3/3 PASS；Agent 实际完成 32×32→64×64 的本地 `image_upscale`，工具本身约 0.09--0.12 s，因此不是主要瓶颈。
 
@@ -81,6 +84,52 @@ CRI ready → runp → create → start → Gateway ready → health → cleanup
 ```
 
 因此该实验确实使用了两个 virtio-blk 路径，而不是误把 overlayfs 单层目录当作完整应用目录。实验脚本为 `scripts/23-benchmark-hybrid-app-state.sh`。
+
+### `/app` 从源目录到 virtio-blk 的实际挂载时序
+
+这里要区分“制作镜像”和“实际挂载”两个动作：`scripts/22` 不会修改正在运行的容器，它只把一个完整的、可启动的 `/app` 树复制进 ext4 镜像；真正把该镜像作为容器 `/app` 使用，是后续容器 spec 加入 mount 项并执行 `crictl create/start` 时完成的。
+
+```text
+直接混合方案（VirtioFS root + virtio-blk /app + virtio-blk state）
+
+正常容器中的完整 /app 合并视图
+        |
+        | scripts/22-prepare-hybrid-path-image.sh
+        | 创建 openclaw-app.ext4，并输出 /dev/loop24
+        v
+宿主机 ext4 镜像：openclaw-app.ext4（只读数据源）
+        |
+        | scripts/23 或 scripts/25
+        | jq 修改 container spec：
+        |   /app -> /dev/loop24 (readonly=true)
+        |   /home/node/.openclaw -> /dev/loop8
+        v
+crictl create/start
+        |
+        | containerd + kuasar-vmm 将两个 host_path 作为 virtio-blk 设备提供给 guest
+        v
+Guest 内核挂载：
+  /dev/vda -> /app                  (ext4, ro)
+  /dev/vdb -> /home/node/.openclaw  (ext4, rw)
+```
+
+因此，`/app` 的“镜像准备”发生在 `scripts/22`，而 `/app` 的“容器挂载”发生在 `scripts/23`/`scripts/25` 生成 spec 并启动容器之后；报告中的 `/dev/loop24` 是宿主机设备名，容器内实际看到的是 `/dev/vda`。
+
+Union 方案不是把 `/app` 直接改成 virtio-blk，而是保留 VirtioFS lower，再把 upper/work 放到 virtio-blk：
+
+```text
+原始 /app（VirtioFS lower） + /dev/loop25（virtio-blk upper/work）
+        |
+        | scripts/29-benchmark-union-image-workload.sh
+        | /tmp -> /dev/loop25，并设置 OPENCLAW_KUASAR_OVERLAY_UNION
+        v
+Kuasar guest union hook
+        |
+        | lower bind -> /app.lower
+        | mount overlay(lower=/app.lower, upper/work=/tmp)
+        v
+容器最终看到：/app = OverlayFS merged view
+```
 
 本实验不包含远端镜像 pull；Agent sample 单独在同一混合挂载配置下运行 3 轮，用于避免把镜像拉取时间混入应用 workload。
 
@@ -327,3 +376,61 @@ union 的复用表现接近 VirtioFS metadata cache，同时保留了 guest 内 
 5. **Agent sample 结果有效**：3/3 轮均完成实际 image_upscale，输出 4096 像素，`fallbackUsed=false`；工具计算约 115 ms，不是主要瓶颈。
 6. **容器复用必须单独解释**：本轮 3 个容器、15 次请求全部通过，但 warm 请求仍通过新的 CLI/session 执行；复用主要摊薄 VMM、CRI 和 Gateway 启动成本，不等价于常驻 Agent 进程或模型连接复用。
 7. **当前推荐**：union 适合作为“VirtioFS 只读 lower + virtio-blk 可写层”的原型，已完成功能与三轮 workload 验证；直接 virtio-blk 仍是性能上界，`cache=metadata` 是较低改动的对照方案。union 尚需并发、长生命周期和常驻 Agent RPC 验证后，才能作为生产默认配置。
+## 11. 2026-08-07 metadata-cache follow-up
+
+为继续优化当前直接混合方案，先在准确记录 `cache=metadata`、sandboxer hash 和三轮挂载证据的条件下做了路径归因，结果目录为 `.artifacts/hybrid-path-profile-metadata-20260807T023709Z`。三轮 Gateway/health 归因命令均返回 `rc=0`，实际挂载保持 `/app=/dev/vda`（ext4，ro）、`/usr/local=/dev/vdb`（ext4，ro）和 state=`/dev/vdc`（ext4，rw）。归因脚本使用 `strace`，所以其中的 Gateway/health guest wall 只用于相对路径归因，不能与普通 workload 的 wall time 直接比较。
+
+路径归因的平均值如下：
+
+| 阶段 | app syscall | state syscall | `/usr/local`+`/usr` syscall | 结论 |
+| --- | ---: | ---: | ---: | --- |
+| Gateway | 4108.7 ms | 约 63.0 ms | **3.3 ms** | `/usr` 不是主要贡献者 |
+| health | 1283.4 ms | 约 26.6 ms | **5.3 ms** | `/usr` 不是主要贡献者 |
+
+因此预先约定的 `/usr` gate 不成立：把完整 `/usr` 再制作成 virtio-blk 镜像没有足够的归因依据，未继续创建该分支，避免增加设备、启动和实验解释变量。
+
+随后对 `virtiofsd.thread_pool_size` 做了 `2/4/8` 三个值、每值 3 个 fresh VMM/container workload 的 sweep。镜像只预拉取一次且不计入 measured phases；每个值的实际配置、sandboxer hash 和 workload 结果都保存在 `.artifacts/hybrid-worker-sweep-20260807T025200Z`。三个配置均为 3/3 PASS，退出时 `restore_rc=0`，系统配置恢复为原来的 `thread_pool_size=4`。
+
+| `thread_pool_size` | start | Gateway ready | health exec wall | Agent sample | total |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 2 | 66.3 ms | 6580.0 ms | 7166.3 ms | 10029.3 ms | 24995.3 ms |
+| 4（原配置） | 65.0 ms | 6693.7 ms | 7191.3 ms | 10007.0 ms | 25134.0 ms |
+| 8 | **65.7 ms** | **6506.7 ms** | **7170.0 ms** | **9851.7 ms** | **24799.3 ms** |
+
+`thread_pool_size=8` 的总耗时相对 `4` 减少约 1.3%，Gateway ready 减少约 2.8%，health 几乎不变（约 0.3%）；start 也没有明显变化。这个结果说明 worker pool 只提供轻微优化，不能解释混合方案与全 virtio-blk 之间的主要差距，因此当前默认配置不自动切换到 8，后续若需要可把 8 作为候选配置做更大样本复核。
+
+综合本轮实验，当前混合方案的主要剩余成本仍来自 `/app` 大量小文件访问以及每次 `crictl exec` 启动 CLI、配置/插件初始化和模型交互；`/usr` 路径和 virtiofsd worker 数量都不是主导项。混合方案已经保留了接近 VirtioFS 的低 `start` 成本，同时把 Gateway/health/sample 显著拉近全 virtio-blk；继续优化应优先考虑 app 数据布局、进程/Agent 常驻复用或更细的 OpenClaw 初始化拆分，而不是盲目增加 virtiofsd worker 或复制整个 `/usr`。
+
+随后第 12 节用不带 `strace` 的真实 Agent workload 做了严格 `/app` A/B，进一步验证了这里的“`/app` 小文件访问”判断，并给出可直接汇报的因果对照。
+
+## 12. `/app` 文件系统严格 A/B：VirtioFS 与 virtio-blk
+
+为确认剩余 Gateway/health 开销是否确实来自 `/app` 的文件系统，新增了严格 A/B。两组均使用 `kuasar-vmm`、VirtioFS rootfs、`cache=metadata`、virtio-blk state（读写）、virtio-blk `/usr/local`（只读）、同一远端镜像、相同的 512 次 image-upscale workload；唯一变量是 `/app` 的 backing。
+
+- A 组：`/app` 使用 VirtioFS，结果目录为 `.artifacts/hybrid-workload-app-virtiofs-20260807T060031Z`。
+- B 组：`/app` 使用 `/dev/loop24` 的 virtio-blk，结果目录为 `.artifacts/hybrid-workload-app-virtio-blk-20260807T061059Z`。
+
+两组均为 3/3 PASS，Agent sample 均返回 `KUASAR_SAMPLE_OK`，没有 fallback。挂载证据分别确认 A 组 `/app=fuseblk`（VirtioFS），B 组 `/app=ext2/ext3`（virtio-blk）；state 和 `/usr/local` 在两组中保持不变。
+
+| 阶段 | `/app` VirtioFS | `/app` virtio-blk | 变化（B-A） |
+| --- | ---: | ---: | ---: |
+| `runp` | 344 ms | 341 ms | -3 ms |
+| `create` | 39 ms | 38 ms | -1 ms |
+| `start` | 63 ms | 70 ms | +7 ms |
+| Gateway ready | 7903 ms | 6553 ms | **-1350 ms（-17.1%）** |
+| health exec wall | 8071 ms | 7027 ms | **-1044 ms（-12.9%）** |
+| health internal | 47 ms | 9 ms | -38 ms |
+| Agent sample exec wall | 11535 ms | 9507 ms | **-2028 ms（-17.6%）** |
+| Agent internal | 4484 ms | 3723 ms | **-761 ms（-17.0%）** |
+| image_upscale tool total | 115.2 ms | 114.2 ms | 基本不变 |
+| total | 28743 ms | 24370 ms | **-4373 ms（-15.2%）** |
+
+该 A/B 证明 `/app` 的存储后端是 Gateway、health 和 Agent 初始化差距的真实来源之一；收益发生在应用文件访问和初始化阶段，而不是 `image_upscale` 本身。`start` 只增加约 7 ms，仍保持 VirtioFS 的低启动成本。当前推荐候选应明确写成：VirtioFS rootfs（`cache=metadata`）+ virtio-blk `/app`（只读）+ virtio-blk state（读写）；本 A/B 将 virtio-blk `/usr/local`（只读）作为两组共同的控制变量，并没有证明它单独带来收益。继续把 `/app` 拆成更多 block 子镜像预计收益有限，只会增加设备和配置复杂度。
+
+这组 A/B 没有使用 `strace`，所以表中的 wall time 可以直接作为实际 workload 的性能比较；前面的路径归因实验带有 tracing 开销，只用于回答“访问来自哪里”，不应与本节的 wall time 相加。需要特别区分：`health exec wall` 不是 Gateway 内部 health 处理时间，它包含一次新的 CLI 启动、配置/插件初始化和 CRI exec 外层；因此 `/app` 后端变化会同时影响 Gateway ready、health wall 和 Agent internal，而工具自身约 115 ms 基本不变。
+
+### 12.1 新结论
+
+- 全 virtio-blk 仍是应用阶段的性能上界，但把约 5.9 s 的设备准备成本放进了 VMM `start`。
+- 在保持 VMM 低启动的前提下，将 `/app` 从 VirtioFS 改为只读 virtio-blk，使 Gateway ready 平均减少约 1.35 s（17.1%），health exec wall 减少约 1.04 s（12.9%），Agent sample exec wall 减少约 2.03 s（17.6%）；`start` 只增加约 7 ms。
+- 因此当前最有说服力的折中不是“所有路径都换成 block”，而是保留 VirtioFS rootfs 的快速启动，把 OpenClaw 启动最常访问的 `/app` 与可写 state 放到 virtio-blk；union 方案保留了更好的 lower/upper 管理语义，但直接 `/app` block 在本轮更快。

@@ -6,9 +6,12 @@ CRI_ENDPOINT="${CRI_ENDPOINT:-unix:///run/openclaw-kuasar/containerd.sock}"
 PROFILE_IMAGE="${HYBRID_PROFILE_IMAGE:-localhost/openclaw-kuasar:2026.6.11-virtiofs-strace}"
 STATE_LOOP_DEVICE="${HYBRID_STATE_LOOP_DEVICE:-}"
 APP_LOOP_DEVICE="${HYBRID_APP_LOOP_DEVICE:-}"
+APP_MODE="${HYBRID_APP_MODE:-virtio-blk}"
 RUNTIME_LOOP_DEVICE="${HYBRID_RUNTIME_LOOP_DEVICE:-}"
 REPEATS="${HYBRID_PATH_REPEATS:-3}"
 RESULT_DIR="${HYBRID_PATH_RESULT_DIR:-$ROOT_DIR/.artifacts/hybrid-path-profile-$(date -u +%Y%m%dT%H%M%SZ)}"
+EXPECTED_CACHE="${HYBRID_EXPECTED_CACHE:-}"
+TOP_PATHS="${HYBRID_TOP_PATHS:-25}"
 
 usage() {
   printf '%s\n' \
@@ -18,10 +21,13 @@ usage() {
     '' \
     'Options:' \
     '  --state-loop DEV       writable state loop device' \
-    '  --app-loop DEV         read-only /app loop device' \
+    '  --app-loop DEV         read-only /app loop device (virtio-blk mode)' \
+    '  --app-mode MODE        /app backing: virtio-blk or virtiofs (default: virtio-blk)' \
     '  --runtime-loop DEV     read-only /usr/local loop device' \
     '  --profile-image IMAGE  profiling image containing strace' \
     '  --repeats N            fresh VMM containers (default: 3)' \
+    '  --expected-cache VALUE require this VirtioFS cache value in vmm.toml' \
+    '  --top-paths N          retain top N file paths per traced command (default: 25)' \
     '  --result-dir DIR       artifact directory' \
     '  -h, --help             show this help'
 }
@@ -30,9 +36,12 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --state-loop) STATE_LOOP_DEVICE="$2"; shift 2 ;;
     --app-loop) APP_LOOP_DEVICE="$2"; shift 2 ;;
+    --app-mode) APP_MODE="$2"; shift 2 ;;
     --runtime-loop) RUNTIME_LOOP_DEVICE="$2"; shift 2 ;;
     --profile-image) PROFILE_IMAGE="$2"; shift 2 ;;
     --repeats) REPEATS="$2"; shift 2 ;;
+    --expected-cache) EXPECTED_CACHE="$2"; shift 2 ;;
+    --top-paths) TOP_PATHS="$2"; shift 2 ;;
     --result-dir) RESULT_DIR="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
@@ -43,8 +52,18 @@ done
   echo 'error: --repeats must be a positive integer' >&2
   exit 2
 }
+[[ "$TOP_PATHS" =~ ^[1-9][0-9]*$ ]] || {
+  echo 'error: --top-paths must be a positive integer' >&2
+  exit 2
+}
+case "$APP_MODE" in
+  virtiofs|virtio-blk) ;;
+  *) echo 'error: --app-mode must be virtiofs or virtio-blk' >&2; exit 2 ;;
+esac
 [ -n "$STATE_LOOP_DEVICE" ] || { echo 'error: --state-loop is required' >&2; exit 2; }
-[ -n "$APP_LOOP_DEVICE" ] || { echo 'error: --app-loop is required' >&2; exit 2; }
+if [ "$APP_MODE" = virtio-blk ]; then
+  [ -n "$APP_LOOP_DEVICE" ] || { echo 'error: --app-loop is required for virtio-blk app mode' >&2; exit 2; }
+fi
 [ -n "$RUNTIME_LOOP_DEVICE" ] || { echo 'error: --runtime-loop is required' >&2; exit 2; }
 
 command -v jq >/dev/null 2>&1 || { echo 'error: jq is required' >&2; exit 1; }
@@ -52,21 +71,42 @@ command -v crictl >/dev/null 2>&1 || { echo 'error: crictl is required' >&2; exi
 command -v awk >/dev/null 2>&1 || { echo 'error: awk is required' >&2; exit 1; }
 sudo -v
 sudo test -b "$STATE_LOOP_DEVICE" || { echo "error: not a block device: $STATE_LOOP_DEVICE" >&2; exit 1; }
-sudo test -b "$APP_LOOP_DEVICE" || { echo "error: not a block device: $APP_LOOP_DEVICE" >&2; exit 1; }
+if [ "$APP_MODE" = virtio-blk ]; then
+  sudo test -b "$APP_LOOP_DEVICE" || { echo "error: not a block device: $APP_LOOP_DEVICE" >&2; exit 1; }
+fi
 sudo test -b "$RUNTIME_LOOP_DEVICE" || { echo "error: not a block device: $RUNTIME_LOOP_DEVICE" >&2; exit 1; }
+
+SYSTEM_CONFIG=/etc/openclaw-kuasar/vmm.toml
+SYSTEM_SANDBOXER=/usr/local/libexec/openclaw-kuasar/vmm-sandboxer
+mkdir -p "$RESULT_DIR/specs" "$RESULT_DIR/evidence"
+
+if [ -n "$EXPECTED_CACHE" ]; then
+  [[ "$EXPECTED_CACHE" =~ ^[A-Za-z0-9_-]+$ ]] || {
+    echo 'error: --expected-cache contains unsupported characters' >&2
+    exit 2
+  }
+  sudo grep -Eq \
+    "^[[:space:]]*cache[[:space:]]*=[[:space:]]*\"${EXPECTED_CACHE}\"" \
+    "$SYSTEM_CONFIG" || {
+      echo "error: $SYSTEM_CONFIG does not select cache=$EXPECTED_CACHE" >&2
+      exit 1
+    }
+fi
+sudo cat "$SYSTEM_CONFIG" > "$RESULT_DIR/evidence/vmm-effective.toml"
+sudo sha256sum "$SYSTEM_SANDBOXER" > "$RESULT_DIR/evidence/sandboxer-sha256.txt"
 
 BASE_POD_SPEC="$ROOT_DIR/containerd/openclaw-pod-vmm.json"
 BASE_CONTAINER_SPEC="$ROOT_DIR/containerd/openclaw-container-vmm.json"
 CRI=(sudo crictl --runtime-endpoint "$CRI_ENDPOINT" --image-endpoint "$CRI_ENDPOINT")
 NDJSON="$RESULT_DIR/results.ndjson"
-mkdir -p "$RESULT_DIR/specs"
 : > "$NDJSON"
 
 printf '%s\n' \
   'Hybrid path attribution plan:' \
   "  image=$PROFILE_IMAGE" \
   '  rootfs=VirtioFS' \
-  "  app_loop=$APP_LOOP_DEVICE" \
+  "  app_mode=$APP_MODE" \
+  "  app_loop=${APP_LOOP_DEVICE:-none}" \
   "  state_loop=$STATE_LOOP_DEVICE" \
   "  runtime_loop=$RUNTIME_LOOP_DEVICE" \
   "  repeats=$REPEATS" \
@@ -116,6 +156,7 @@ make_specs() {
     --arg image "$PROFILE_IMAGE" \
     --arg state "$STATE_LOOP_DEVICE" \
     --arg app "$APP_LOOP_DEVICE" \
+    --arg app_mode "$APP_MODE" \
     --arg runtime "$RUNTIME_LOOP_DEVICE" \
     --arg wrapper "$wrapper" \
     --arg log_path "$log_path" \
@@ -128,11 +169,15 @@ make_specs() {
      (.mounts |= map(select(.container_path != "/app" and
                             .container_path != "/usr/local" and
                             .container_path != "/home/node/.openclaw"))) |
-     .mounts += [
-       {container_path:"/app",host_path:$app,readonly:true},
-       {container_path:"/usr/local",host_path:$runtime,readonly:true},
-       {container_path:"/home/node/.openclaw",host_path:$state,readonly:false}
-     ]' \
+     .mounts += (
+       (if $app_mode == "virtio-blk" then
+          [{container_path:"/app",host_path:$app,readonly:true}]
+        else [] end)
+       + [
+         {container_path:"/usr/local",host_path:$runtime,readonly:true},
+         {container_path:"/home/node/.openclaw",host_path:$state,readonly:false}
+       ]
+     )' \
     "$BASE_CONTAINER_SPEC" > "$container_spec"
 }
 
@@ -149,11 +194,37 @@ AWK_PROGRAM+='BEGIN { names[1]="app"; names[2]="state"; names[3]="usr_local"; na
 AWK_PROGRAM+='{ q=index($0,"\""); if (q == 0) next; rest=substr($0,q+1); q2=index(rest,"\""); if (q2 == 0) next; p=substr(rest,1,q2-1); d=0; if (match($0, /<[0-9.]+>$/)) d=substr($0,RSTART+1,RLENGTH-2)*1000; b=bucket(p); count[b]++; time[b]+=d; }'
 AWK_PROGRAM+='END { printf "{\"buckets\":{"; for (i=1;i<=6;i++) { b=names[i]; if (i>1) printf ","; printf "\"%s\":{\"events\":%d,\"syscall_ms\":%.3f}",b,count[b]+0,time[b]+0; } print "}}"; }'
 
+TOP_AWK_PROGRAM=''
+TOP_AWK_PROGRAM+='function path_from_line(    q,rest,q2) { q=index($0,"\""); if (q == 0) return ""; rest=substr($0,q+1); q2=index(rest,"\""); if (q2 == 0) return ""; return substr(rest,1,q2-1); }'
+TOP_AWK_PROGRAM+='{ p=path_from_line(); if (p == "") next; d=0; if (match($0, /<[0-9.]+>$/)) d=substr($0,RSTART+1,RLENGTH-2)*1000; count[p]++; time[p]+=d; }'
+TOP_AWK_PROGRAM+='END { for (i=1;i<=limit;i++) { best=""; best_time=-1; for (p in time) if (!(p in used) && time[p] > best_time) { best=p; best_time=time[p]; } if (best == "") break; used[best]=1; printf "%.3f\t%d\t%s\n",time[best]+0,count[best]+0,best; } }'
+
 aggregate_trace() {
   local cid="$1" prefix="$2"
   "${CRI[@]}" exec "$cid" sh -c \
     'prefix=$1; program=$2; awk "$program" "$prefix".*' \
     sh "$prefix" "$AWK_PROGRAM"
+}
+
+aggregate_top_trace() {
+  local cid="$1" prefix="$2"
+  "${CRI[@]}" exec "$cid" sh -c \
+    'prefix=$1; program=$2; limit=$3; awk -v limit="$limit" "$program" "$prefix".*' \
+    sh "$prefix" "$TOP_AWK_PROGRAM" "$TOP_PATHS"
+}
+
+top_tsv_to_json() {
+  local tsv="$1"
+  if [ -z "$tsv" ]; then
+    printf '[]'
+    return 0
+  fi
+  printf '%s\n' "$tsv" | jq -R -s '
+    split("\n")
+    | map(select(length > 0))
+    | map(split("\t") | select(length >= 3) |
+        {syscall_ms:(.[0] | tonumber), events:(.[1] | tonumber), path:(.[2:] | join("\t"))})
+  '
 }
 
 extract_path_json() {
@@ -175,7 +246,7 @@ remove_trace() {
 
 trace_cli() {
   local cid="$1" uid="$2" run="$3" label="$4" trace_prefix="$5"
-  local host_begin host_end raw rc guest_ms guest_rc path_json
+  local host_begin host_end raw rc guest_ms guest_rc path_json top_tsv top_json
   local -a args
   case "$label" in
     config_validate) args=(node openclaw.mjs config validate) ;;
@@ -197,6 +268,9 @@ trace_cli() {
   guest_ms="$(normalize_uint "${guest_ms:-0}")"
   guest_rc="$(normalize_uint "${guest_rc:-$rc}")"
   path_json="$(extract_path_json "$(aggregate_trace "$cid" "$trace_prefix")")"
+  top_tsv="$(aggregate_top_trace "$cid" "$trace_prefix")"
+  printf '%s\n' "$top_tsv" > "$RESULT_DIR/${uid}-${label}-top.tsv"
+  top_json="$(top_tsv_to_json "$top_tsv")"
   jq -n \
     --arg handler kuasar-vmm \
     --arg command "$label" \
@@ -205,14 +279,18 @@ trace_cli() {
     --argjson host_ms "$((host_end-host_begin))" \
     --argjson guest_ms "$guest_ms" \
     --argjson path "$path_json" \
-    '{handler:$handler,run:$run,command:$command,rc:$rc,host_wall_ms:$host_ms,guest_wall_ms:$guest_ms,transport_residual_ms:($host_ms-$guest_ms),path:$path}' \
+    --argjson top_paths "$top_json" \
+    --arg cache_mode "$EXPECTED_CACHE" \
+    --arg app_mode "$APP_MODE" \
+    --arg vmm_config "$SYSTEM_CONFIG" \
+    '{handler:$handler,run:$run,command:$command,rc:$rc,app_mode:$app_mode,cache_mode:$cache_mode,vmm_config:$vmm_config,host_wall_ms:$host_ms,guest_wall_ms:$guest_ms,transport_residual_ms:($host_ms-$guest_ms),path:$path,top_paths:$top_paths}' \
     | tee -a "$NDJSON"
   remove_trace "$cid" "$trace_prefix"
 }
 
 trace_gateway_health() {
   local cid="$1" uid="$2" run="$3" gateway_prefix="$4" health_prefix="$5"
-  local host_begin host_end raw rc gateway_ms health_ms health_rc path_gateway path_health
+  local host_begin host_end raw rc gateway_ms health_ms health_rc path_gateway path_health top_gateway_tsv top_health_tsv top_gateway_json top_health_json
   host_begin="$(now_ms)"
   set +e
   raw="$("${CRI[@]}" exec "$cid" sh -c \
@@ -230,6 +308,12 @@ trace_gateway_health() {
   health_rc="$(normalize_uint "${health_rc:-$rc}")"
   path_gateway="$(extract_path_json "$(aggregate_trace "$cid" "$gateway_prefix")")"
   path_health="$(extract_path_json "$(aggregate_trace "$cid" "$health_prefix")")"
+  top_gateway_tsv="$(aggregate_top_trace "$cid" "$gateway_prefix")"
+  top_health_tsv="$(aggregate_top_trace "$cid" "$health_prefix")"
+  printf '%s\n' "$top_gateway_tsv" > "$RESULT_DIR/${uid}-gateway-top.tsv"
+  printf '%s\n' "$top_health_tsv" > "$RESULT_DIR/${uid}-health-top.tsv"
+  top_gateway_json="$(top_tsv_to_json "$top_gateway_tsv")"
+  top_health_json="$(top_tsv_to_json "$top_health_tsv")"
   "${CRI[@]}" exec "$cid" cat /tmp/hybrid-path-health.json > "$RESULT_DIR/${uid}-gateway-health.json" 2>/dev/null || true
   jq -n \
     --arg handler kuasar-vmm \
@@ -241,7 +325,12 @@ trace_gateway_health() {
     --argjson health_ms "$health_ms" \
     --argjson gateway_path "$path_gateway" \
     --argjson health_path "$path_health" \
-    '{handler:$handler,run:$run,command:$command,rc:$rc,host_wall_ms:$host_ms,gateway_guest_ms:$gateway_ms,health_guest_ms:$health_ms,transport_residual_ms:($host_ms-$gateway_ms-$health_ms),path:{gateway:$gateway_path,health:$health_path}}' \
+    --argjson top_gateway "$top_gateway_json" \
+    --argjson top_health "$top_health_json" \
+    --arg cache_mode "$EXPECTED_CACHE" \
+    --arg app_mode "$APP_MODE" \
+    --arg vmm_config "$SYSTEM_CONFIG" \
+    '{handler:$handler,run:$run,command:$command,rc:$rc,app_mode:$app_mode,cache_mode:$cache_mode,vmm_config:$vmm_config,host_wall_ms:$host_ms,gateway_guest_ms:$gateway_ms,health_guest_ms:$health_ms,transport_residual_ms:($host_ms-$gateway_ms-$health_ms),path:{gateway:$gateway_path,health:$health_path},top_paths:{gateway:$top_gateway,health:$top_health}}' \
     | tee -a "$NDJSON"
   remove_trace "$cid" "$gateway_prefix"
   remove_trace "$cid" "$health_prefix"

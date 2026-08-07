@@ -21,7 +21,7 @@ unix:///run/openclaw-kuasar/containerd.sock
 完整实验报告见：[docs/2026-07-21-runtime-breakdown.md](docs/2026-07-21-runtime-breakdown.md)。
 故障处理与上下文恢复见：[HANDOFF.md](HANDOFF.md)。
 
-## 当前状态（2026-07-22）
+## 当前状态（2026-08-07）
 
 部署 gate 和最终实验(每条Openclaw路径3轮实验)均已完成：
 
@@ -89,9 +89,28 @@ containerd root/state 后从服务器 B `10.2.30.50:5000` 拉取，三种 handle
 | 整轮 total | 16.327 s | 16.291 s | 125.394 s |
 
 图片工具本身只耗时约 87--91 ms，VMM 约为 runc 的 1.04 倍，因此图片计算不是
-VMM 慢的来源。当前最可信的首要瓶颈是 VMM 通过 virtiofs 访问 `/app` 模块和插件
-树时的大量小文件 metadata 操作；Node compile-cache 重建和 SQLite state/journal
-检查是待 A/B 验证的次级因素。
+VMM 慢的来源。后续 `/app` 文件系统严格 A/B 已确认：将 `/app` 从 VirtioFS 换成
+virtio-blk 后，Gateway、health 和 Agent 初始化均明显下降，而 `start` 只增加数毫秒。
+
+## `/app` 混合挂载严格 A/B 结果
+
+两组均使用 VirtioFS rootfs、virtio-blk state、virtio-blk `/usr/local`、同一远端镜像和
+相同的 512-pass image-upscale workload；唯一变量是 `/app` 的 backing。每组 3 轮，
+均为 3/3 PASS，Agent sample 无 fallback。
+
+| 指标（3 轮平均） | `/app` VirtioFS | `/app` virtio-blk |
+| --- | ---: | ---: |
+| `start` | 63 ms | 70 ms |
+| Gateway ready | 7.903 s | **6.553 s** |
+| health exec wall | 8.071 s | **7.027 s** |
+| Agent sample exec wall | 11.535 s | **9.507 s** |
+| Agent internal | 4.484 s | **3.723 s** |
+| `image_upscale` tool total | 115.2 ms | 114.2 ms |
+| 整轮 total | 28.743 s | **24.370 s** |
+
+这说明 `/app` 小文件访问是混合方案剩余延迟的主要来源之一；将 `/app` 放到
+virtio-blk 可以保留 VirtioFS 的低 VMM 启动成本，同时显著改善 Gateway、health 和
+Agent 初始化。
 
 ## 固定版本与配置
 
